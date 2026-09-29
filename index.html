@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>远程控制</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{display:flex;justify-content:center;align-items:center;min-height:100vh;
+       background:#1a1a2e;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",Arial,sans-serif;
+       color:#eee;-webkit-text-size-adjust:100%}
+  .card{background:#16213e;border-radius:16px;padding:32px 26px;width:90%;max-width:340px;
+        text-align:center;box-shadow:0 8px 32px rgba(0,0,0,.4);position:relative}
+  h1{color:#eee;font-size:20px;margin-bottom:4px;word-break:break-all;padding:0 26px}
+  .dot{display:inline-block;width:12px;height:12px;border-radius:50%;background:#555;vertical-align:middle;margin-top:10px}
+  .dot.on{background:#4caf50;box-shadow:0 0 10px #4caf50}
+  .st{color:#ddd;font-size:30px;font-weight:bold;margin:12px 0 26px;letter-spacing:1px}
+  .pwr{width:100%;padding:18px;border:none;border-radius:12px;color:#fff;
+       font-size:20px;font-weight:bold;cursor:pointer;background:#4caf50;min-height:64px}
+  .pwr.off{background:#546e7a}
+  .pwr:disabled{opacity:.55}
+  .pwr:active{opacity:.82}
+  .foot{color:#666;font-size:11px;margin-top:18px;min-height:14px}
+  .foot.bad{color:#e57373}
+  .gear{position:absolute;top:10px;right:12px;background:none;border:none;color:#5a6480;
+        font-size:20px;cursor:pointer;padding:4px 6px;line-height:1}
+  .panel{display:none;text-align:left;margin-top:22px;padding-top:18px;border-top:1px dashed #334}
+  .panel.show{display:block}
+  label{display:block;color:#bbb;font-size:13px;margin:12px 0 4px}
+  input{width:100%;padding:10px 12px;border:1px solid #334;border-radius:8px;
+        background:#0f1a33;color:#eee;font-size:15px;outline:none}
+  input:focus{border-color:#2196F3}
+  .row{display:flex;gap:8px}
+  .row>input{flex:1}
+  .mini{margin-top:14px;padding:11px;border:none;border-radius:8px;background:#2196F3;
+        color:#fff;font-size:14px;font-weight:bold;cursor:pointer;width:100%}
+  .mini:active{opacity:.8}
+  .mini.gray{background:#455a64}
+  .note{color:#888;font-size:12px;margin-top:16px;line-height:1.6}
+  .warn{color:#e0a800;font-size:12px;margin-top:10px;line-height:1.6}
+</style>
+</head>
+<body>
+<div class="card">
+  <button class="gear" type="button" id="gear" title="设置">⚙</button>
+  <h1 id="title">LED01</h1>
+  <div><span class="dot" id="dot"></span></div>
+  <div class="st" id="state">--</div>
+  <button class="pwr off" id="pwr">读取中</button>
+  <div class="foot" id="foot">正在连接巴法云…</div>
+
+  <div class="panel" id="panel">
+    <label>巴法云私钥（只保存在本机浏览器，不写进网页文件）</label>
+    <div class="row">
+      <input id="uid" type="password" inputmode="latin" autocomplete="off" placeholder="用户私钥">
+      <button class="mini gray" type="button" id="eye" style="width:auto;padding:11px 12px">显示</button>
+    </div>
+    <label>主题</label>
+    <input id="topic" inputmode="latin" autocomplete="off" placeholder="relay">
+    <label>备注名（显示在标题）</label>
+    <input id="name" placeholder="LED01">
+    <button class="mini" type="button" id="save">保存设置</button>
+    <div class="foot" id="cfgMsg"></div>
+    <div class="warn">私钥保存在本机 localStorage。别人拿到这个网页文件也控制不了你的设备，但拿到你手机/浏览器数据的人可以。</div>
+  </div>
+</div>
+<script>
+var API_SEND = 'https://apis.bemfa.com/va/sendMessage';
+var API_INFO = 'https://apis.bemfa.com/vb/api/v2/topicInfo';
+var LS_UID = 'bemfa_ctl_uid', LS_TOPIC = 'bemfa_ctl_topic', LS_NAME = 'bemfa_ctl_name';
+var DEFAULT_TOPIC = 'relay';
+
+var uid = localStorage.getItem(LS_UID) || '';
+var topic = localStorage.getItem(LS_TOPIC) || DEFAULT_TOPIC;
+var name = localStorage.getItem(LS_NAME) || 'LED01';
+var state = null;        // true=开 false=关 null=未知
+var sending = false;
+var timer = null;
+
+function $(id){ return document.getElementById(id); }
+
+function render(){
+  $('title').textContent = name;
+  var dot = $('dot'), st = $('state'), pwr = $('pwr');
+  dot.className = 'dot' + (state === true ? ' on' : '');
+  if(state === null){ st.textContent = '--'; }
+  else { st.textContent = state ? 'ON' : 'OFF'; }
+  if(sending){ pwr.textContent = '发送中…'; pwr.className = 'pwr'; pwr.disabled = true; return; }
+  pwr.disabled = false;
+  if(state === null){ pwr.textContent = '点击开启'; pwr.className = 'pwr off'; }
+  else if(state){ pwr.textContent = '点击关闭'; pwr.className = 'pwr'; }
+  else { pwr.textContent = '点击开启'; pwr.className = 'pwr off'; }
+}
+
+function foot(text, bad){
+  var f = $('foot');
+  f.textContent = text;
+  f.className = 'foot' + (bad ? ' bad' : '');
+}
+
+function withTs(url){
+  return url + (url.indexOf('?') >= 0 ? '&' : '?') + '_=' + Date.now();
+}
+
+function ready(){
+  if(!uid){ showPanel(true); foot('请先填巴法云私钥', true); render(); return false; }
+  return true;
+}
+
+function showPanel(show){
+  $('panel').className = show ? 'panel show' : 'panel';
+}
+
+function readState(){
+  if(!ready()) return;
+  var url = API_INFO + '?openID=' + encodeURIComponent(uid) +
+            '&type=1&topic=' + encodeURIComponent(topic);
+  fetch(withTs(url), {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(j.code !== 0){
+        state = null;
+        foot('读取失败：' + (j.msg || j.message || ('code ' + j.code)) + '（检查私钥/主题）', true);
+        render();
+        return;
+      }
+      var d = j.data || {};
+      var m = (d.msg || '').toLowerCase();
+      if(m === 'on' || m === '1') state = true;
+      else if(m === 'off' || m === '0') state = false;
+      else state = null;
+      var conn = d.pubOnline ? '' : ' · 设备离线或未连接';
+      foot((state === null ? '状态未知' : '已同步') + conn);
+      render();
+    })
+    .catch(function(e){ state = null; foot('网络错误：' + e.message, true); render(); });
+}
+
+function send(cmd){
+  if(!ready() || sending) return;
+  sending = true; render();
+  var url = API_SEND + '?uid=' + encodeURIComponent(uid) +
+            '&topic=' + encodeURIComponent(topic) + '&type=1&msg=' + cmd;
+  fetch(withTs(url), {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(j.code !== 0){
+        foot('下发失败：' + (j.message || j.msg || ('code ' + j.code)), true);
+      }else{
+        foot('已下发 ' + cmd.toUpperCase() + '，等待设备回报…');
+      }
+      sending = false;
+      render();
+      setTimeout(readState, 1200);
+    })
+    .catch(function(e){
+      sending = false;
+      foot('网络错误：' + e.message, true);
+      render();
+    });
+}
+
+$('pwr').addEventListener('click', function(){
+  if(state === null){ readState(); return; }
+  send(state ? 'off' : 'on');
+});
+
+$('gear').addEventListener('click', function(){
+  var p = $('panel');
+  var show = !p.className.match(/show/);
+  if(show){
+    $('uid').value = uid;
+    $('topic').value = topic;
+    $('name').value = name;
+  }
+  showPanel(show);
+});
+
+$('eye').addEventListener('click', function(){
+  var i = $('uid');
+  i.type = (i.type === 'password') ? 'text' : 'password';
+  this.textContent = (i.type === 'password') ? '显示' : '隐藏';
+});
+
+$('save').addEventListener('click', function(){
+  var u = $('uid').value.trim();
+  var t = $('topic').value.trim() || DEFAULT_TOPIC;
+  var n = $('name').value.trim() || 'LED01';
+  if(!u){ $('cfgMsg').textContent = '请填写私钥'; $('cfgMsg').className = 'foot bad'; return; }
+  uid = u; topic = t; name = n;
+  localStorage.setItem(LS_UID, uid);
+  localStorage.setItem(LS_TOPIC, topic);
+  localStorage.setItem(LS_NAME, name);
+  $('cfgMsg').textContent = '已保存到本机浏览器';
+  $('cfgMsg').className = 'foot';
+  showPanel(false);
+  readState();
+});
+
+if(!uid){ showPanel(true); foot('请先填巴法云私钥', true); render(); }
+else { readState(); }
+render();
+if(timer) clearInterval(timer);
+timer = setInterval(function(){ if(!sending) readState(); }, 3000);
+document.addEventListener('visibilitychange', function(){
+  if(document.hidden){ if(timer) clearInterval(timer); timer = null; }
+  else { if(!timer) timer = setInterval(function(){ if(!sending) readState(); }, 3000); readState(); }
+});
+</script>
+</body>
+</html>
