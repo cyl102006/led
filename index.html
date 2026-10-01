@@ -22,6 +22,13 @@
   .pwr:active{opacity:.82}
   .foot{color:#666;font-size:11px;margin-top:18px;min-height:14px}
   .foot.bad{color:#e57373}
+  .hist{margin-top:26px;padding-top:18px;border-top:1px dashed #334;text-align:left}
+  .hist h2{color:#bbb;font-size:13px;font-weight:normal;margin-bottom:12px;text-align:center}
+  .hrow{display:flex;align-items:baseline;gap:8px;margin:9px 0;font-size:13px}
+  .hrow .lb{color:#888;flex:0 0 52px}
+  .hrow .vl{color:#ddd;flex:1;text-align:right;font-variant-numeric:tabular-nums}
+  .hrow .no{color:#555}
+  .hist .empty{color:#555;font-size:12px;text-align:center;margin-top:4px}
   .gear{position:absolute;top:10px;right:12px;background:none;border:none;color:#5a6480;
         font-size:20px;cursor:pointer;padding:4px 6px;line-height:1}
   .panel{display:none;text-align:left;margin-top:22px;padding-top:18px;border-top:1px dashed #334}
@@ -48,6 +55,15 @@
   <div class="st" id="state">--</div>
   <button class="pwr off" id="pwr">读取中</button>
   <div class="foot" id="foot">正在连接巴法云…</div>
+
+  <div class="hist">
+    <h2>最近两次记录</h2>
+    <div class="hrow"><span class="lb">开启</span><span class="vl no" id="on0">—</span></div>
+    <div class="hrow"><span class="lb"></span><span class="vl no" id="on1">—</span></div>
+    <div class="hrow"><span class="lb">关闭</span><span class="vl no" id="off0">—</span></div>
+    <div class="hrow"><span class="lb"></span><span class="vl no" id="off1">—</span></div>
+    <div class="empty" id="histNote"></div>
+  </div>
 
   <div class="panel" id="panel">
     <label>巴法云私钥（只保存在本机浏览器，不写进网页文件）</label>
@@ -76,6 +92,7 @@ var name = localStorage.getItem(LS_NAME) || 'LED01';
 var state = null;        // true=开 false=关 null=未知
 var sending = false;
 var timer = null;
+var hist = null;         // 最近两次开启/关闭时刻（含当前状态），null=还没读到
 
 function $(id){ return document.getElementById(id); }
 
@@ -102,6 +119,35 @@ function withTs(url){
   return url + (url.indexOf('?') >= 0 ? '&' : '?') + '_=' + Date.now();
 }
 
+// UNIX 秒 → 本地时间。0 表示没记录过，显示占位符而不是 1970 年。
+function fmtTs(ts){
+  if(!ts) return '';
+  var d=new Date(ts*1000);
+  function p(n){ return n<10?'0'+n:''+n; }
+  return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+
+         p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+}
+
+function renderHist(){
+  var pairs=[['on0',(hist&&hist.on||[])[0]],['on1',(hist&&hist.on||[])[1]],
+             ['off0',(hist&&hist.off||[])[0]],['off1',(hist&&hist.off||[])[1]]];
+  pairs.forEach(function(p){
+    var el=document.getElementById(p[0]);
+    var t=fmtTs(p[1]);
+    el.textContent=t||'—';
+    el.className='vl'+(t?'':' no');
+  });
+  // 没数据时说明原因，避免把「设备没上报」误当成「没有记录」
+  var note=$('histNote');
+  if(hist===null){
+    note.textContent='等待设备上报记录…';
+  }else if(!(hist.on&&hist.on[0])&&!(hist.off&&hist.off[0])){
+    note.textContent='还没有开关记录';
+  }else{
+    note.textContent='';
+  }
+}
+
 function ready(){
   if(!uid){ showPanel(true); foot('请先填巴法云私钥', true); render(); return false; }
   return true;
@@ -125,13 +171,27 @@ function readState(){
         return;
       }
       var d = j.data || {};
-      var m = (d.msg || '').toLowerCase();
-      if(m === 'on' || m === '1') state = true;
-      else if(m === 'off' || m === '0') state = false;
-      else state = null;
+      var m = (d.msg || '').trim();
+      // 状态和时间在同一条 retained 消息里（巴法云只允许往已存在的主题发布，
+      // 所以没法再开一个主题单独放历史）。固件发的是
+      // {s:0|1, on:[t,t], off:[t,t]}。
+      var o = null;
+      try { o = JSON.parse(m); } catch(e){ o = null; }
+      if(o && typeof o === 'object' && typeof o.s !== 'undefined'){
+        state = (o.s === 1);
+        hist = o;
+      }else if(m === 'on' || m === '1' || m === 'ON'){
+        // 兼容旧固件：只发纯 ON/OFF 文本，没有历史
+        state = true;
+      }else if(m === 'off' || m === '0' || m === 'OFF'){
+        state = false;
+      }else{
+        state = null;
+      }
       var conn = d.pubOnline ? '' : ' · 设备离线或未连接';
       foot((state === null ? '状态未知' : '已同步') + conn);
       render();
+      renderHist();
     })
     .catch(function(e){ state = null; foot('网络错误：' + e.message, true); render(); });
 }
@@ -151,7 +211,8 @@ function send(cmd){
       }
       sending = false;
       render();
-      setTimeout(readState, 1200);
+      // 设备收到指令后才会有新记录，稍晚一点再拉一次（状态和时间在同一条消息里）
+      setTimeout(readState, 1500);
     })
     .catch(function(e){
       sending = false;
@@ -194,18 +255,21 @@ $('save').addEventListener('click', function(){
   $('cfgMsg').textContent = '已保存到本机浏览器';
   $('cfgMsg').className = 'foot';
   showPanel(false);
+  hist = null;          // 主题可能换了，之前的历史作废
+  renderHist();
   readState();
 });
 
 if(!uid){ showPanel(true); foot('请先填巴法云私钥', true); render(); }
 else { readState(); }
-render();
+render(); renderHist();
 if(timer) clearInterval(timer);
 timer = setInterval(function(){ if(!sending) readState(); }, 3000);
 document.addEventListener('visibilitychange', function(){
-  if(document.hidden){ if(timer) clearInterval(timer); timer = null; }
+  if(document.hidden){ if(timer){ clearInterval(timer); timer = null; } }
   else { if(!timer) timer = setInterval(function(){ if(!sending) readState(); }, 3000); readState(); }
 });
 </script>
 </body>
 </html>
+
