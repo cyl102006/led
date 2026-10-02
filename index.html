@@ -47,11 +47,16 @@
   .warn{color:#e0a800;font-size:12px;margin-top:10px;line-height:1.6}
   .gate{display:none;margin-top:10px}
   .gate.show{display:block}
+  .siren{position:absolute;top:10px;left:12px;background:none;border:1px solid #334;color:#5a6480;
+         font-size:12px;cursor:pointer;padding:4px 8px;border-radius:8px;line-height:1}
+  .siren.on{color:#4caf50;border-color:#2f5d3a}
+  .mini.sub{background:#37474f;margin-top:10px}
 </style>
 </head>
 <body>
 <div class="card">
   <button class="gear" type="button" id="gear" title="设置">⚙</button>
+  <button class="siren on" type="button" id="siren" title="芯片灯亮时响1秒">🔔 提示音开</button>
   <h1 id="title">LED01</h1>
   <div><span class="dot" id="dot"></span></div>
   <div class="st" id="state">--</div>
@@ -85,6 +90,7 @@
     <label>备注名（显示在标题）</label>
     <input id="name" placeholder="LED01">
     <button class="mini" type="button" id="save">保存设置</button>
+    <button class="mini sub" type="button" id="sirenTest">试一下提示音（响 1 秒）</button>
     <div class="foot" id="cfgMsg"></div>
     <div class="warn">私钥保存在本机 localStorage。别人拿到这个网页文件也控制不了你的设备，但拿到你手机/浏览器数据的人可以。私钥默认隐藏，点「显示」需输入密码。</div>
   </div>
@@ -93,6 +99,7 @@
 var API_SEND = 'https://apis.bemfa.com/va/sendMessage';
 var API_INFO = 'https://apis.bemfa.com/vb/api/v2/topicInfo';
 var LS_UID = 'bemfa_ctl_uid', LS_TOPIC = 'bemfa_ctl_topic', LS_NAME = 'bemfa_ctl_name';
+var LS_ALARM = 'bemfa_ctl_alarm';
 var DEFAULT_TOPIC = 'relay';
 // 查看私钥的密码。私钥默认以圆点隐藏，点「显示」要先过这道密码。
 var UNLOCK_PWD = '99998888';
@@ -105,6 +112,69 @@ var state = null;        // true=开 false=关 null=未知
 var sending = false;
 var timer = null;
 var hist = null;         // 最近两次开启/关闭时刻（含当前状态），null=还没读到
+
+// ---------------- 灯亮提示音 ----------------
+// 芯片灯由关变亮时，手机响 1 秒并震动。
+// 只认「明确的 OFF→ON」：刚打开页面时状态是未知(null)，灯本来就亮着，不该响。
+var alarmOn = localStorage.getItem(LS_ALARM) !== '0';
+var lastState = null;    // 上一次读到成功且已知的灯状态，null=未知
+var AC = null;
+
+function ac(){
+  if(!AC){
+    var C = window.AudioContext || window.webkitAudioContext;
+    if(!C) return null;
+    AC = new C();
+  }
+  if(AC.state === 'suspended' && AC.resume) AC.resume();
+  return AC;
+}
+
+// 手机浏览器禁止自动播放，必须先有一次点击手势解锁音频
+function unlockAudio(){
+  if(!alarmOn) return;
+  var a = ac();
+  if(a && a.state === 'running') return true;
+  return false;
+}
+
+function tone(a, freq, start, dur, vol){
+  var o = a.createOscillator(), g = a.createGain();
+  o.type = 'sine';
+  o.frequency.value = freq;
+  g.gain.setValueAtTime(0.0001, start);
+  g.gain.exponentialRampToValueAtTime(vol, start + 0.02);
+  g.gain.setValueAtTime(vol, start + dur - 0.05);
+  g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+  o.connect(g); g.connect(a.destination);
+  o.start(start); o.stop(start + dur + 0.02);
+}
+
+// 三声上行，总长 1 秒：0.25 + 0.25 + 0.5
+function playBeep(){
+  var a = ac();
+  if(!a) return false;
+  var t = a.currentTime + 0.02;
+  tone(a, 880,  t, 0.25, 0.30);
+  tone(a, 1175, t + 0.25, 0.25, 0.30);
+  tone(a, 1568, t + 0.50, 0.50, 0.30);
+  return true;
+}
+
+function alarm(){
+  if(!alarmOn) return;
+  var ok = playBeep();
+  if(navigator.vibrate){
+    try{ navigator.vibrate([320, 180, 500]); }catch(e){}
+  }
+  if(!ok) foot('手机禁止了自动播放：点一下页面任意位置即可开启提示音', true);
+}
+
+function renderAlarm(){
+  var b = $('siren');
+  b.textContent = alarmOn ? '🔔 提示音开' : '🔕 提示音关';
+  b.className = 'siren' + (alarmOn ? ' on' : '');
+}
 
 function $(id){ return document.getElementById(id); }
 
@@ -199,11 +269,15 @@ function readState(){
         state = false;
       }else{
         state = null;
-      }
+}
       var conn = d.pubOnline ? '' : ' · 设备离线或未连接';
       foot((state === null ? '状态未知' : '已同步') + conn);
       render();
       renderHist();
+      // 只有明确读到「原来是关、现在开」才响。读取失败时不改 lastState，
+      // 否则中间断一次网络就再也不会响了。
+      if(state === true && lastState === false) alarm();
+      if(state !== null) lastState = state;
     })
     .catch(function(e){ state = null; foot('网络错误：' + e.message, true); render(); });
 }
@@ -234,9 +308,41 @@ function send(cmd){
 }
 
 $('pwr').addEventListener('click', function(){
+  unlockAudio();
   if(state === null){ readState(); return; }
   send(state ? 'off' : 'on');
 });
+
+// ---- 提示音开关：点一下先解锁音频，方便当场试响 ----
+$('siren').addEventListener('click', function(){
+  alarmOn = !alarmOn;
+  localStorage.setItem(LS_ALARM, alarmOn ? '1' : '0');
+  renderAlarm();
+  if(alarmOn){
+    unlockAudio();
+    var a = ac();
+    if(a && a.state !== 'running'){
+      foot('浏览器仍在拦截声音，请点一下页面其它位置，或用安卓/苹果自带浏览器打开', true);
+    }
+  }
+});
+
+$('sirenTest').addEventListener('click', function(){
+  if(!alarmOn){ $('cfgMsg').textContent = '提示音是关的，先点左上角 🔔 打开'; $('cfgMsg').className = 'foot bad'; return; }
+  if(!playBeep()){ $('cfgMsg').textContent = '这个浏览器不支持网页发声'; $('cfgMsg').className = 'foot bad'; return; }
+  if(navigator.vibrate){ try{ navigator.vibrate([320, 180, 500]); }catch(e){} }
+  $('cfgMsg').textContent = '这就是灯亮时手机响的样子（1 秒）';
+  $('cfgMsg').className = 'foot';
+});
+
+// 任何一次点击/触摸都解锁音频，之后灯亮就能自动响
+function onceUnlock(){
+  unlockAudio();
+  document.removeEventListener('pointerdown', onceUnlock);
+  document.removeEventListener('touchstart', onceUnlock);
+}
+document.addEventListener('pointerdown', onceUnlock);
+document.addEventListener('touchstart', onceUnlock);
 
 $('gear').addEventListener('click', function(){
   var p = $('panel');
@@ -317,7 +423,7 @@ $('save').addEventListener('click', function(){
 
 if(!uid){ showPanel(true); foot('请先填巴法云私钥', true); render(); }
 else { readState(); }
-render(); renderHist();
+render(); renderHist(); renderAlarm();
 if(timer) clearInterval(timer);
 timer = setInterval(function(){ if(!sending) readState(); }, 3000);
 document.addEventListener('visibilitychange', function(){
