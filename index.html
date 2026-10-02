@@ -45,6 +45,8 @@
   .mini.gray{background:#455a64}
   .note{color:#888;font-size:12px;margin-top:16px;line-height:1.6}
   .warn{color:#e0a800;font-size:12px;margin-top:10px;line-height:1.6}
+  .gate{display:none;margin-top:10px}
+  .gate.show{display:block}
 </style>
 </head>
 <body>
@@ -71,13 +73,20 @@
       <input id="uid" type="password" inputmode="latin" autocomplete="off" placeholder="用户私钥">
       <button class="mini gray" type="button" id="eye" style="width:auto;padding:11px 12px">显示</button>
     </div>
+    <div class="gate" id="gate">
+      <div class="row">
+        <input id="pwd" type="password" inputmode="numeric" autocomplete="off" placeholder="输入密码查看私钥">
+        <button class="mini gray" type="button" id="gateOk" style="width:auto;padding:11px 12px">确定</button>
+      </div>
+      <div class="foot" id="gateMsg"></div>
+    </div>
     <label>主题</label>
     <input id="topic" inputmode="latin" autocomplete="off" placeholder="relay">
     <label>备注名（显示在标题）</label>
     <input id="name" placeholder="LED01">
     <button class="mini" type="button" id="save">保存设置</button>
     <div class="foot" id="cfgMsg"></div>
-    <div class="warn">私钥保存在本机 localStorage。别人拿到这个网页文件也控制不了你的设备，但拿到你手机/浏览器数据的人可以。</div>
+    <div class="warn">私钥保存在本机 localStorage。别人拿到这个网页文件也控制不了你的设备，但拿到你手机/浏览器数据的人可以。私钥默认隐藏，点「显示」需输入密码。</div>
   </div>
 </div>
 <script>
@@ -85,6 +94,9 @@ var API_SEND = 'https://apis.bemfa.com/va/sendMessage';
 var API_INFO = 'https://apis.bemfa.com/vb/api/v2/topicInfo';
 var LS_UID = 'bemfa_ctl_uid', LS_TOPIC = 'bemfa_ctl_topic', LS_NAME = 'bemfa_ctl_name';
 var DEFAULT_TOPIC = 'relay';
+// 查看私钥的密码。私钥默认以圆点隐藏，点「显示」要先过这道密码。
+var UNLOCK_PWD = '99998888';
+var unlocked = false;
 
 var uid = localStorage.getItem(LS_UID) || '';
 var topic = localStorage.getItem(LS_TOPIC) || DEFAULT_TOPIC;
@@ -233,14 +245,55 @@ $('gear').addEventListener('click', function(){
     $('uid').value = uid;
     $('topic').value = topic;
     $('name').value = name;
+    hideUid();     // 每次打开设置都回到「隐藏」，不会因为上次验过就一直明文
+    closeGate();
   }
   showPanel(show);
 });
 
+// ---- 私钥显示密码门：没输对密码就不把输入框切成明文 ----
+function gateMsg(text, bad){
+  var m = $('gateMsg');
+  m.textContent = text;
+  m.className = 'foot' + (bad ? ' bad' : '');
+}
+function closeGate(){
+  $('gate').className = 'gate';
+  $('pwd').value = '';
+  gateMsg('');
+}
+function showUid(){
+  $('uid').type = 'text';
+  $('eye').textContent = '隐藏';
+}
+function hideUid(){
+  $('uid').type = 'password';
+  $('eye').textContent = '显示';
+}
+$('gateOk').addEventListener('click', function(){
+  if($('pwd').value !== UNLOCK_PWD){
+    // 密码错就保持隐藏。密码框留着不关，方便直接重输，不用再点一次「显示」。
+    hideUid();
+    gateMsg('密码错误', true);
+    $('pwd').value = '';
+    return;
+  }
+  unlocked = true;
+  closeGate();
+  showUid();
+});
+$('pwd').addEventListener('keydown', function(e){
+  if(e.key === 'Enter' || e.keyCode === 13){
+    e.preventDefault();
+    $('gateOk').click();
+  }
+});
+
 $('eye').addEventListener('click', function(){
-  var i = $('uid');
-  i.type = (i.type === 'password') ? 'text' : 'password';
-  this.textContent = (i.type === 'password') ? '显示' : '隐藏';
+  if($('uid').type === 'text'){ hideUid(); return; }   // 已经显示 → 收回
+  if(unlocked){ showUid(); return; }                    // 这次会话验过了 → 直接显示
+  $('gate').className = 'gate show';                    // 否则先要密码
+  $('pwd').focus();
 });
 
 $('save').addEventListener('click', function(){
@@ -254,6 +307,8 @@ $('save').addEventListener('click', function(){
   localStorage.setItem(LS_NAME, name);
   $('cfgMsg').textContent = '已保存到本机浏览器';
   $('cfgMsg').className = 'foot';
+  hideUid();            // 存完立刻收回明文
+  closeGate();
   showPanel(false);
   hist = null;          // 主题可能换了，之前的历史作废
   renderHist();
