@@ -19,6 +19,10 @@
   .dot{display:inline-block;width:12px;height:12px;border-radius:50%;background:#555;vertical-align:middle;margin-top:10px}
   .dot.on{background:#4caf50;box-shadow:0 0 10px #4caf50}
   .st{color:#ddd;font-size:30px;font-weight:bold;margin:12px 0 24px;letter-spacing:1px}
+  .pin{color:#8a8a8a;font-size:12px;margin:-14px 0 20px}
+  .pin b{color:#bbb;font-weight:normal}
+  .pin .dot{width:9px;height:9px;margin:0 4px 0 0}
+  .pin .dot.on{background:#ffb300;box-shadow:0 0 8px #ffb300}
   .pwr{width:100%;padding:18px;border:none;border-radius:12px;color:#fff;
        font-size:20px;font-weight:bold;cursor:pointer;background:#4caf50;min-height:64px}
   .pwr.off{background:#546e7a}
@@ -76,12 +80,14 @@
 <div class="card">
   <div class="topbar">
     <button type="button" id="siren" title="灯亮时响铃">🔔 响铃</button>
+    <button type="button" id="mode" title="什么情况下响铃">🚪 呼叫</button>
     <button type="button" id="wake" title="防止手机熄屏">📱 常亮</button>
   </div>
   <button class="gear" type="button" id="gear" title="设置">⚙</button>
   <h1 id="title">LED01</h1>
   <div><span class="dot" id="dot"></span></div>
   <div class="st" id="state">--</div>
+  <div class="pin"><span class="dot" id="pinDot"></span>GPIO2 呼叫脚：<b id="pinState">--</b>　已呼叫 <b id="callN">0</b> 次</div>
   <button class="pwr off" id="pwr">读取中</button>
   <div class="ack" id="ackBox" style="display:none">
     <button class="mini stop" type="button" id="ack">🛑 知道了，停止响铃</button>
@@ -89,12 +95,22 @@
   <div class="foot" id="foot">正在连接巴法云…</div>
 
   <div class="hist">
-    <h2>最近两次记录</h2>
+    <h2>开关记录（最近两次）</h2>
     <div class="hrow"><span class="lb">开启</span><span class="vl no" id="on0">—</span></div>
     <div class="hrow"><span class="lb"></span><span class="vl no" id="on1">—</span></div>
     <div class="hrow"><span class="lb">关闭</span><span class="vl no" id="off0">—</span></div>
     <div class="hrow"><span class="lb"></span><span class="vl no" id="off1">—</span></div>
     <div class="empty" id="histNote"></div>
+  </div>
+
+  <div class="hist">
+    <h2>呼叫记录（指示灯亮 + GPIO2 低电平，最近 5 次）</h2>
+    <div class="hrow"><span class="lb">呼叫</span><span class="vl no" id="tg0">—</span></div>
+    <div class="hrow"><span class="lb"></span><span class="vl no" id="tg1">—</span></div>
+    <div class="hrow"><span class="lb"></span><span class="vl no" id="tg2">—</span></div>
+    <div class="hrow"><span class="lb"></span><span class="vl no" id="tg3">—</span></div>
+    <div class="hrow"><span class="lb"></span><span class="vl no" id="tg4">—</span></div>
+    <div class="empty" id="trigNote"></div>
   </div>
 
   <div class="panel" id="panel">
@@ -105,6 +121,8 @@
       <div class="drow"><span>屏幕常亮生效</span><span id="dWake">?</span></div>
       <div class="drow"><span>系统通知权限</span><span id="dNote">?</span></div>
       <div class="drow"><span>最近一次读状态</span><span id="dSync">?</span></div>
+      <div class="drow"><span>最近一次呼叫</span><span id="dCall">?</span></div>
+      <div class="drow"><span>响铃条件</span><span id="dMode">?</span></div>
       <div class="warn" id="dHint"></div>
     </div>
     <button class="mini acc" type="button" id="lockTest">🔔 测试锁屏响铃（连响 15 秒）</button>
@@ -130,6 +148,13 @@
     <input id="name" placeholder="LED01">
     <button class="mini" type="button" id="save">保存设置</button>
 
+    <div class="warn"><b>现在什么情况下响铃：</b><br>
+      左上 <b>🚪 呼叫响铃</b>（默认）：指示灯亮着 + <b>GPIO2 被接地（低电平）</b> → 手机响，并记下这次时刻。<br>
+      点一下切成 <b>💡 灯亮就响</b>：回到旧行为，每次开灯都响，不看 GPIO2。</div>
+    <div class="warn"><b>GPIO2 怎么接：</b>一端接 GPIO2，另一端接 GND（按钮、门铃、磁簧开关都行）。
+      松开时靠芯片内部上拉读到高电平，按下读到低电平。<br>
+      <b>注意：</b>GPIO2 同时是芯片的启动模式脚，复位那一刻必须为高，
+      所以按钮不能「按住不放」再断电，也别用常闭触点把它长期拉低 —— 那样芯片开不了机。</div>
     <div class="warn"><b>锁屏想听到声音，靠这四件事，缺一不可：</b><br>
       1. 先<b>点一下页面任意位置</b>解锁音频（浏览器强制要求）。<br>
       2. 右上诊断里 <b>保活声音 = 运行中</b>。它是一段听不见的循环音频，
@@ -147,6 +172,7 @@ var API_SEND = 'https://apis.bemfa.com/va/sendMessage';
 var API_INFO = 'https://apis.bemfa.com/vb/api/v2/topicInfo';
 var LS_UID = 'bemfa_ctl_uid', LS_TOPIC = 'bemfa_ctl_topic', LS_NAME = 'bemfa_ctl_name';
 var LS_ALARM = 'bemfa_ctl_alarm', LS_WAKE = 'bemfa_ctl_wake', LS_ONTS = 'bemfa_ctl_last_on';
+var LS_SEQ = 'bemfa_ctl_callseq', LS_MODE = 'bemfa_ctl_ringmode';
 var DEFAULT_TOPIC = 'relay';
 // 查看私钥的密码。私钥默认以圆点隐藏，点「显示」要先过这道密码。
 var UNLOCK_PWD = '99998888';
@@ -169,6 +195,16 @@ var wakeOn  = localStorage.getItem(LS_WAKE) !== '0';
 // 最近一次已知的「开启时刻」。既是响铃判据的基线，也存进 localStorage，
 // 关掉页面再打开时不会把很久以前的那次开灯当成新事件。
 var lastOnTs = parseInt(localStorage.getItem(LS_ONTS) || '0', 10) || 0;
+// 芯片自增的呼叫序号。固件每判定一次「灯亮 + GPIO2 低电平」就 +1 并立刻上报，
+// 页面拿它和上次读到的值比：变大就是刚发生过一次呼叫。
+// 存 localStorage 做基线，所以刚打开页面不会把上一次的呼叫当成新的。
+// 用序号而不是时间戳：同一秒内连按两次时时间戳一样，会漏掉第二次。
+var lastCallSeq = parseInt(localStorage.getItem(LS_SEQ) || '0', 10) || 0;
+// 响铃条件：true = 呼叫时响（指示灯亮 + GPIO2 低电平），false = 灯亮就响（旧行为）。
+// 默认走呼叫，硬件接了 GPIO2 按钮后不需要按一下就直接响。
+var ringOnCall = localStorage.getItem(LS_MODE) !== 'light';
+var alarmReason = '';    // 这次响铃是被什么触发的：'call' / 'light'
+var lastCallTs = 0;      // 最近一次呼叫的时刻，只用于显示
 var lastSyncAt = 0;      // 上次成功读到状态的时间，用于诊断锁屏后网页是否还活着
 var alarmUntil = 0;      // 响铃截止时间戳，0=不响
 var lastBeepAt = 0;      // 上次实际发出声音的时间戳
@@ -318,9 +354,10 @@ function notify(title, body){
   }catch(e){ return false; }
 }
 
-function setAlarm(seconds){
+function setAlarm(seconds, reason){
   var now = Date.now();
   alarmUntil = now + (seconds || ALARM_MS);
+  alarmReason = reason || '';
   fireOnce();
   renderAck();
 }
@@ -333,11 +370,20 @@ function fireOnce(){
   if(navigator.vibrate){
     try{ navigator.vibrate([400,200,600,200,600,200,600]); }catch(e){}
   }
-  if(document.hidden) notify(name + ' 开灯了', '灯由关变亮，正在持续响铃提醒（60 秒）');
+  if(document.hidden){
+    // 呼叫和开灯用不同的措辞：锁屏上只看到一行字，要能一眼分清是什么事
+    if(alarmReason === 'call'){
+      var at = fmtTs(lastCallTs);
+      notify('有人呼叫（' + name + '）', 'GPIO2 已触发' + (at ? ' · ' + at : '') + '，正在持续响铃提醒（60 秒）');
+    }else{
+      notify(name + ' 开灯了', '灯由关变亮，正在持续响铃提醒（60 秒）');
+    }
+  }
 }
 
 function stopAlarm(){
   alarmUntil = 0;
+  alarmReason = '';
   renderAck();
 }
 
@@ -347,9 +393,10 @@ function alarmTick(){
   if(!alarmOn || !alarmUntil) return;
   // 只有明确读到「关」才停。读到 null 是「这次没读成功」，
   // 一次网络抖动就把提醒掐掉是最糟的情况——那正是最需要响的时候。
-  if(state === false){ alarmUntil = 0; renderAck(); return; }
+  // 呼叫触发的响铃不看灯：呼叫时灯本来就是亮的，用灯灭去停它等于自己掐掉自己。
+  if(state === false && alarmReason !== 'call'){ alarmUntil = 0; renderAck(); return; }
   if(Date.now() - lastBeepAt >= ALARM_GAP) fireOnce();
-  if(Date.now() >= alarmUntil){ alarmUntil = 0; renderAck(); }
+  if(Date.now() >= alarmUntil){ alarmUntil = 0; alarmReason = ''; renderAck(); }
 }
 
 function requestNotifyPermission(){
@@ -371,6 +418,8 @@ function unlockAudio(){
 
 function renderAck(){
   $('ackBox').style.display = alarmUntil ? 'block' : 'none';
+  var b = $('ack');
+  if(b) b.textContent = (alarmReason === 'call' ? '🛑 知道了，停止响铃（呼叫）' : '🛑 知道了，停止响铃');
 }
 
 function mark(el, text, cls){
@@ -402,6 +451,9 @@ function renderDiag(){
   }else{
     mark('dSync', '尚未成功读取', 'n');
   }
+  var ct = fmtTs(lastCallTs);
+  mark('dCall', ct ? ct : (lastCallSeq ? '有 ' + lastCallSeq + ' 次，时间未知' : '还没有'), ct ? 'y' : 'w');
+  mark('dMode', ringOnCall ? '呼叫（灯亮+GPIO2低）' : '灯亮就响', 'w');
   // 直接告诉用户还差什么，比让人自己猜要快得多
   var h = [];
   if(!audioOK) h.push('还没解锁音频：请<b>点一下页面</b>。');
@@ -416,6 +468,14 @@ function renderAlarm(){
   var b = $('siren');
   b.textContent = alarmOn ? '🔔 响铃开' : '🔕 响铃关';
   b.className = alarmOn ? 'on' : '';
+}
+
+// 响铃条件：呼叫（灯亮+GPIO2 低电平）还是只灯亮。默认呼叫。
+function renderMode(){
+  var b = $('mode');
+  if(!b) return;
+  b.textContent = ringOnCall ? '🚪 呼叫响铃' : '💡 灯亮就响';
+  b.className = ringOnCall ? 'on' : '';
 }
 
 function renderWake(){
@@ -472,6 +532,16 @@ function renderHist(){
     el.textContent = t || '—';
     el.className = 'vl' + (t ? '' : ' no');
   });
+  // 呼叫记录固定画 5 行：固件保证 trig 长度就是 5，空的补 —，
+  // 这样「总是显示最近 5 次」，不会出现有时 2 行有时 5 行。
+  var tg = (hist && hist.trig) || [];
+  for(var i = 0; i < 5; i++){
+    var el = document.getElementById('tg' + i);
+    if(!el) continue;
+    var t = fmtTs(tg[i]);
+    el.textContent = t || '—';
+    el.className = 'vl' + (t ? '' : ' no');
+  }
   // 没数据时说明原因，避免把「设备没上报」误当成「没有记录」
   var note = $('histNote');
   if(hist === null){
@@ -481,6 +551,21 @@ function renderHist(){
   }else{
     note.textContent = '';
   }
+  var tn = $('trigNote');
+  if(hist === null){
+    tn.textContent = '等待设备上报记录…';
+  }else if(!(hist.trig && hist.trig[0])){
+    tn.textContent = '还没有呼叫记录（指示灯亮时把 GPIO2 接地试一次）';
+  }else{
+    tn.textContent = '';
+  }
+  // GPIO2 当前电平
+  var pd = $('pinDot');
+  if(pd) pd.className = 'dot' + ((hist && hist.pin === 1) ? ' on' : '');
+  var ps = $('pinState');
+  if(ps) ps.textContent = hist === null ? '--' : ((hist.pin === 1) ? '低电平（已按下）' : '高电平');
+  var cn = $('callN');
+  if(cn) cn.textContent = (hist && typeof hist.seq === 'number') ? hist.seq : 0;
 }
 
 function ready(){
@@ -499,12 +584,30 @@ function showPanel(show){
 // 分不清是刚才开的还是开了一整天。
 // 开启时刻存在 retained 消息里，冻结结束后一比就知道。
 // 基线存 localStorage，所以刚打开页面不会把上一次开灯当成新事件。
+// 只在「灯亮就响」模式下判；呼叫模式下灯亮本身不该吵人。
 function checkOnTs(o){
+  if(ringOnCall) return;
   if(!o || !o.on || !o.on[0]) return;
   var t = o.on[0];
-  if(lastOnTs && t > lastOnTs) setAlarm(ALARM_MS);
+  if(lastOnTs && t > lastOnTs) setAlarm(ALARM_MS, 'light');
   lastOnTs = t;
   try{ localStorage.setItem(LS_ONTS, String(t)); }catch(e){}
+}
+
+// 呼叫判据：固件的呼叫序号 seq 变大了。
+// 和开灯判据同理用「变新」而不是「现在是低电平」——页面被冻结时，
+// 那 50ms 的低电平窗口根本轮询不到，只看电平会整个漏掉这次呼叫。
+// 首次读到 seq 时只立基线不响，否则刚打开页面就会补响上一次的呼叫。
+function checkCallSeq(o){
+  var q = (o && typeof o.seq === 'number') ? o.seq : 0;
+  if(q && lastCallSeq && q > lastCallSeq && ringOnCall){
+    lastCallTs = (o.trig && o.trig[0]) ? o.trig[0] : 0;
+    setAlarm(ALARM_MS, 'call');
+  }
+  if(q){
+    lastCallSeq = q;
+    try{ localStorage.setItem(LS_SEQ, String(q)); }catch(e){}
+  }
 }
 
 function readState(){
@@ -525,13 +628,14 @@ function readState(){
       var m = (d.msg || '').trim();
       // 状态和时间在同一条 retained 消息里（巴法云只允许往已存在的主题发布，
       // 所以没法再开一个主题单独放历史）。固件发的是
-      // {s:0|1, on:[t,t], off:[t,t]}。
+      // {s:0|1, pin:0|1, seq:N, on:[t,t], off:[t,t], trig:[t,t,t,t,t]}。
       var o = null;
       try { o = JSON.parse(m); } catch(e){ o = null; }
       if(o && typeof o === 'object' && typeof o.s !== 'undefined'){
         state = (o.s === 1);
         hist = o;
         checkOnTs(o);
+        checkCallSeq(o);
       }else if(m === 'on' || m === '1' || m === 'ON'){
         // 兼容旧固件：只发纯 ON/OFF 文本，没有历史
         state = true;
@@ -614,6 +718,18 @@ $('siren').addEventListener('click', function(e){
 });
 
 // ---- 常亮开关 ----
+// ---- 响铃条件切换 ----
+// 默认「呼叫响铃」：指示灯亮 + GPIO2 低电平才响。
+// 切到「灯亮就响」就是旧行为（每次开灯都响），方便不接 GPIO2 时继续用。
+$('mode').addEventListener('click', function(e){
+  e.stopPropagation();
+  ringOnCall = !ringOnCall;
+  localStorage.setItem(LS_MODE, ringOnCall ? 'call' : 'light');
+  renderMode();
+  foot(ringOnCall ? '响铃条件：指示灯亮 + GPIO2 低电平（呼叫）'
+                  : '响铃条件：指示灯一亮就响（旧行为）');
+});
+
 $('wake').addEventListener('click', function(e){
   e.stopPropagation();
   wakeOn = !wakeOn;
@@ -642,7 +758,9 @@ $('lockTest').addEventListener('click', function(e){
   requestNotifyPermission();
   requestWake();
   stopAlarm();
-  setAlarm(15000);              // 和真实提醒一样的持续时长
+  // 用 'call' 而不是开灯原因：测试时灯往往是灭的，
+  // 若按开灯原因处理，alarmTick 一读到「关」就把测试铃掐掉了。
+  setAlarm(15000, 'call');
   cfgMsg('现在正在连响 15 秒。把屏幕按灭再让人开灯试一次。');
 });
 
@@ -755,6 +873,8 @@ $('save').addEventListener('click', function(e){
   hist = null;          // 主题可能换了，之前的历史作废
   lastOnTs = 0;         // 基线作废，避免换主题后拿旧开启时刻当新事件
   try{ localStorage.setItem(LS_ONTS, '0'); }catch(e){}
+  lastCallSeq = 0;      // 呼叫基线同样作废
+  try{ localStorage.setItem(LS_SEQ, '0'); }catch(e){}
   renderHist();
   readState();
 });
@@ -786,7 +906,7 @@ window.addEventListener('resume', function(){ requestWake(); startKeepAlive(); r
 
 if(!uid){ showPanel(true); foot('请先填巴法云私钥', true); render(); }
 else { readState(); }
-render(); renderHist(); renderAlarm(); renderWake(); renderAck(); renderDiag();
+render(); renderHist(); renderAlarm(); renderMode(); renderWake(); renderAck(); renderDiag();
 startTimer();
 setInterval(keepAliveWatchdog, 2000);
 setInterval(renderDiag, 3000);
