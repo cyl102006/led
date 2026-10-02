@@ -104,12 +104,13 @@
   </div>
 
   <div class="hist">
-    <h2>呼叫记录（指示灯亮 + GPIO2 低电平，最近 5 次）</h2>
-    <div class="hrow"><span class="lb">呼叫</span><span class="vl no" id="tg0">—</span></div>
-    <div class="hrow"><span class="lb"></span><span class="vl no" id="tg1">—</span></div>
-    <div class="hrow"><span class="lb"></span><span class="vl no" id="tg2">—</span></div>
-    <div class="hrow"><span class="lb"></span><span class="vl no" id="tg3">—</span></div>
-    <div class="hrow"><span class="lb"></span><span class="vl no" id="tg4">—</span></div>
+    <h2>最近记录（呼叫 / 断网，最近 6 次）</h2>
+    <div class="hrow"><span class="lb" id="tk0">呼叫</span><span class="vl no" id="tg0">—</span></div>
+    <div class="hrow"><span class="lb" id="tk1"></span><span class="vl no" id="tg1">—</span></div>
+    <div class="hrow"><span class="lb" id="tk2"></span><span class="vl no" id="tg2">—</span></div>
+    <div class="hrow"><span class="lb" id="tk3"></span><span class="vl no" id="tg3">—</span></div>
+    <div class="hrow"><span class="lb" id="tk4"></span><span class="vl no" id="tg4">—</span></div>
+    <div class="hrow"><span class="lb" id="tk5"></span><span class="vl no" id="tg5">—</span></div>
     <div class="empty" id="trigNote"></div>
   </div>
 
@@ -123,6 +124,8 @@
       <div class="drow"><span>最近一次读状态</span><span id="dSync">?</span></div>
       <div class="drow"><span>最近一次呼叫</span><span id="dCall">?</span></div>
       <div class="drow"><span>响铃条件</span><span id="dMode">?</span></div>
+      <div class="drow"><span>设备在线</span><span id="dOnline">?</span></div>
+      <div class="drow" id="vibRow"><span>震动（点这里试一下）</span><span id="dVib">?</span></div>
       <div class="warn" id="dHint"></div>
     </div>
     <button class="mini acc" type="button" id="lockTest">🔔 测试锁屏响铃（连响 15 秒）</button>
@@ -203,11 +206,66 @@ var lastCallSeq = parseInt(localStorage.getItem(LS_SEQ) || '0', 10) || 0;
 // 响铃条件：true = 呼叫时响（指示灯亮 + GPIO2 低电平），false = 灯亮就响（旧行为）。
 // 默认走呼叫，硬件接了 GPIO2 按钮后不需要按一下就直接响。
 var ringOnCall = localStorage.getItem(LS_MODE) !== 'light';
-var alarmReason = '';    // 这次响铃是被什么触发的：'call' / 'light'
+var alarmReason = '';    // 这次响铃是被什么触发的：'call' / 'light' / 'offline'
 var lastCallTs = 0;      // 最近一次呼叫的时刻，只用于显示
 var lastSyncAt = 0;      // 上次成功读到状态的时间，用于诊断锁屏后网页是否还活着
 var alarmUntil = 0;      // 响铃截止时间戳，0=不响
 var lastBeepAt = 0;      // 上次实际发出声音的时间戳
+
+// ---- 断网记录 ----
+// 芯片断网这件事只有手机能看见（芯片自己不知道有没有人在看它），
+// 所以断网时刻存在这台手机的 localStorage 里，没法写回芯片 EEPROM。
+// 呼叫记录在芯片里（trig，6 条），断网记录在这里（6 条），
+// 渲染时两者合并成一条时间线，取最近 6 次显示。
+var LOG_N = 6;                    // 统一记录条数：总是显示最近 6 次
+var LOG_MIN_GAP_S = 60;           // 相邻两条记录至少隔 1 分钟
+var OFFLINE_ALARM_MS = 60000;     // 断网持续超过 1 分钟才报警
+var LS_OFFLOG = 'bemfa_ctl_offlog';
+var offlineLog = loadOfflineLog();
+var offlineSince = 0;             // 第一次读到设备离线的时刻；0 = 目前在线
+var offlineFired = false;         // 这次断网已经报过警没有（防止每轮轮询都响）
+
+function loadOfflineLog(){
+  try{
+    var a = JSON.parse(localStorage.getItem(LS_OFFLOG) || '[]');
+    if(Object.prototype.toString.call(a) !== '[object Array]') return [];
+    return a.filter(function(x){ return typeof x === 'number' && x > 0; }).slice(0, LOG_N);
+  }catch(e){ return []; }
+}
+function saveOfflineLog(){
+  try{ localStorage.setItem(LS_OFFLOG, JSON.stringify(offlineLog.slice(0, LOG_N))); }catch(e){}
+}
+// 加一条断网记录，并守住「相邻两条至少隔 1 分钟」。
+// 设备反复掉线/恢复时这条规则很重要，否则几秒钟就能刷出好几条。
+function pushOffline(t){
+  if(!t) return;
+  if(offlineLog.length && offlineLog[0] && t >= offlineLog[0] &&
+     (t - offlineLog[0]) < LOG_MIN_GAP_S) return;
+  offlineLog.unshift(t);
+  if(offlineLog.length > LOG_N) offlineLog.length = LOG_N;
+  saveOfflineLog();
+}
+
+// 断网判据：读到「明确的离线」并且已经持续满 1 分钟。
+// 只有 false 才算断网；读不到（null）是网络抖动，那恰恰是最不该误报的时候。
+// 这一次断网只报一次警，设备回来之后才重新武装——
+// 否则每 2.5 秒轮询一次就会连着响。
+function checkOnline(online){
+  var now = Date.now();
+  // 读不到就是「不知道」，绝不能当成断网。
+  // 这个判断必须写在最前面显式判 null/undefined：写成 if(online) 的话，
+  // null 是假值，会直接掉进下面的断网分支，网络一抖动就误报一次掉线。
+  if(online === null || online === undefined) return;
+  if(online){ offlineSince = 0; offlineFired = false; return; }   // 回来了
+  if(!offlineSince) offlineSince = now;                            // 开始计时
+  if(offlineFired) return;                                         // 这次已经报过
+  if(now - offlineSince < OFFLINE_ALARM_MS) return;                // 还没满 1 分钟
+  offlineFired = true;
+  // 记「断网开始的时刻」，不是报 alarm 的时刻：报警要等满 1 分钟才发生，
+  // 但用户想知道的是它什么时候掉的线。
+  pushOffline(Math.floor(offlineSince / 1000));
+  if(alarmOn) setAlarm(ALARM_MS, 'offline');   // 响铃开关开着才吵人
+}
 
 var AC = null;
 var kaEl = null, kaUrl = null;
@@ -331,9 +389,36 @@ function requestWake(){
   }catch(e){ renderDiag(); }
 }
 
+// ---------------- 震动 ----------------
+// 先说清楚一件很要紧的事：**iPhone / iPad 根本不支持网页震动**。
+// WebKit 从来没有实现 Vibration API，所以 navigator.vibrate 是 undefined，
+// Notification 里的 vibrate 参数也会被直接忽略。这是系统的限制，不是这个页面的 bug，
+// 加多少代码都没用——iPhone 上「响铃+震动」里的震动那半边做不到。
+// 安卓 Chrome / Edge / Firefox 支持，只要页面被点过一次（有用户手势）就能用。
+// 下面把能力检测 + 自检暴露出来，这样一眼就能看出自己的机器属于哪一种。
+function vibSupported(){
+  return (typeof navigator.vibrate === 'function');
+}
+function vib(pat){
+  if(!vibSupported()) return false;
+  try{ return navigator.vibrate(pat) !== false; }catch(e){ return false; }
+}
+// 第一次点击页面时顺手震一下做「预热」。
+// 部分安卓浏览器要求震动发生在用户手势里，否则后续定时调用会被无视；
+// 这里把这次震动放在真正的 click 回调里，满足「手势内」的要求。
+function vibPrime(){
+  if(!vibSupported() || vibDone) return;
+  vibDone = true;
+  try{ navigator.vibrate(30); }catch(e){}
+}
+var vibDone = false;
+
+// 响铃时的震动：比原来更长、更有节奏感，提醒窗口内每轮都会重新触发一次。
+var VIB_ALARM = [600,300,600,300,900,400,900];
 // ---------------- 系统通知 ----------------
-// 手动锁屏后网页基本已被冻结，只有系统通知还能照常响铃并震动。
-// 安卓浏览器直接可用；iPhone 需先在 Safari 里「添加到主屏幕」再用。
+// 手动锁屏后网页基本已被冻结，只有系统通知还能照常响铃。
+// 注意：通知的「震动」是走系统通知设置决定的（静音/专注模式会直接吞掉），
+// 页面控制不了它，也没法保证。上面 vib() 那条路才是页面能主动发震的。
 function notify(title, body){
   if(!alarmOn) return false;
   if(!('Notification' in window)) return false;
@@ -368,13 +453,16 @@ function fireOnce(){
   playBeep(ALARM_ROUNDS);
   startKeepAlive();          // 响完立刻把保活音频挂回去
   if(navigator.vibrate){
-    try{ navigator.vibrate([400,200,600,200,600,200,600]); }catch(e){}
+    try{ navigator.vibrate(VIB_ALARM); }catch(e){}
   }
   if(document.hidden){
-    // 呼叫和开灯用不同的措辞：锁屏上只看到一行字，要能一眼分清是什么事
+    // 三种事由用不同的措辞：锁屏上只看到一行字，要能一眼分清是什么事
     if(alarmReason === 'call'){
       var at = fmtTs(lastCallTs);
       notify('有人呼叫（' + name + '）', 'GPIO2 已触发' + (at ? ' · ' + at : '') + '，正在持续响铃提醒（60 秒）');
+    }else if(alarmReason === 'offline'){
+      var ot = fmtTs(offlineLog[0]);
+      notify(name + ' 断网了', '已超过 1 分钟连不上' + (ot ? ' · ' + ot : '') + '，请检查设备电源和 WiFi');
     }else{
       notify(name + ' 开灯了', '灯由关变亮，正在持续响铃提醒（60 秒）');
     }
@@ -391,10 +479,15 @@ function stopAlarm(){
 // 这是「第一次没听见也有下一次」的保证。
 function alarmTick(){
   if(!alarmOn || !alarmUntil) return;
+  // 断网提醒：设备一连上就停。这是好消息，不用继续吵了。
+  if(alarmReason === 'offline' && !offlineSince){ stopAlarm(); return; }
   // 只有明确读到「关」才停。读到 null 是「这次没读成功」，
   // 一次网络抖动就把提醒掐掉是最糟的情况——那正是最需要响的时候。
   // 呼叫触发的响铃不看灯：呼叫时灯本来就是亮的，用灯灭去停它等于自己掐掉自己。
-  if(state === false && alarmReason !== 'call'){ alarmUntil = 0; renderAck(); return; }
+  // 断网同理：断网时读到的状态可能是很久以前的，用它来停只会误停。
+  if(state === false && alarmReason !== 'call' && alarmReason !== 'offline'){
+    alarmUntil = 0; renderAck(); return;
+  }
   if(Date.now() - lastBeepAt >= ALARM_GAP) fireOnce();
   if(Date.now() >= alarmUntil){ alarmUntil = 0; alarmReason = ''; renderAck(); }
 }
@@ -419,7 +512,9 @@ function unlockAudio(){
 function renderAck(){
   $('ackBox').style.display = alarmUntil ? 'block' : 'none';
   var b = $('ack');
-  if(b) b.textContent = (alarmReason === 'call' ? '🛑 知道了，停止响铃（呼叫）' : '🛑 知道了，停止响铃');
+  var why = (alarmReason === 'call' ? '（呼叫）'
+           : alarmReason === 'offline' ? '（断网）' : '');
+  if(b) b.textContent = '🛑 知道了，停止响铃' + why;
 }
 
 function mark(el, text, cls){
@@ -454,6 +549,26 @@ function renderDiag(){
   var ct = fmtTs(lastCallTs);
   mark('dCall', ct ? ct : (lastCallSeq ? '有 ' + lastCallSeq + ' 次，时间未知' : '还没有'), ct ? 'y' : 'w');
   mark('dMode', ringOnCall ? '呼叫（灯亮+GPIO2低）' : '灯亮就响', 'w');
+  // 断网状态：报警的这盏红灯要能看出「已经断多久了」
+  var onEl = $('dOnline');
+  if(onEl){
+    if(!offlineSince){
+      onEl.textContent = '在线'; onEl.className = 'y';
+    }else{
+      var secs = Math.floor((Date.now() - offlineSince) / 1000);
+      onEl.textContent = '离线 ' + secs + ' 秒' + (offlineFired ? '（已报警）' : '（满 1 分钟才响）');
+      onEl.className = offlineFired ? 'r' : 'w';
+    }
+  }
+  // 震动能力：直接告诉用户这台机器到底支不支持，一眼就能定位问题
+  var vEl = $('dVib');
+  if(vEl){
+    if(vibSupported()){
+      vEl.textContent = '支持，点这里试'; vEl.className = 'y';
+    }else{
+      vEl.textContent = '不支持'; vEl.className = 'r';
+    }
+  }
   // 直接告诉用户还差什么，比让人自己猜要快得多
   var h = [];
   if(!audioOK) h.push('还没解锁音频：请<b>点一下页面</b>。');
@@ -523,6 +638,18 @@ function fmtTs(ts){
          p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
 }
 
+// 把「芯片里的呼叫时刻」和「本机记的断网时刻」合成一条时间线，取最近 6 条。
+// 两个来源必须合并显示：呼叫在芯片 EEPROM 里，断网只存在这台手机上，
+// 分成两块的话「总是显示最近 6 次」就没有一个统一的口径。
+// 相邻两条至少隔 1 分钟这个规则在写入时已经各自守住了，这里只管排序和截断。
+function mergedEvents(){
+  var out = [], tg = (hist && hist.trig) || [], i;
+  for(i = 0; i < tg.length; i++){ if(tg[i]) out.push({t: tg[i], k: '呼叫'}); }
+  for(i = 0; i < offlineLog.length; i++){ if(offlineLog[i]) out.push({t: offlineLog[i], k: '断网'}); }
+  out.sort(function(a, b){ return b.t - a.t; });
+  return out.slice(0, LOG_N);
+}
+
 function renderHist(){
   var pairs = [['on0',(hist&&hist.on||[])[0]], ['on1',(hist&&hist.on||[])[1]],
                ['off0',(hist&&hist.off||[])[0]], ['off1',(hist&&hist.off||[])[1]]];
@@ -532,15 +659,18 @@ function renderHist(){
     el.textContent = t || '—';
     el.className = 'vl' + (t ? '' : ' no');
   });
-  // 呼叫记录固定画 5 行：固件保证 trig 长度就是 5，空的补 —，
-  // 这样「总是显示最近 5 次」，不会出现有时 2 行有时 5 行。
-  var tg = (hist && hist.trig) || [];
-  for(var i = 0; i < 5; i++){
+  // 统一记录固定画 6 行：固件保证 trig 有 6 个槽，断网记录本机最多存 6 条，
+  // 合并后不够的补 —，这样「总是显示最近 6 次」，不会有时 2 行有时 6 行。
+  var ev = mergedEvents();
+  for(var i = 0; i < LOG_N; i++){
     var el = document.getElementById('tg' + i);
+    var kl = document.getElementById('tk' + i);
     if(!el) continue;
-    var t = fmtTs(tg[i]);
+    var e = ev[i];
+    var t = e ? fmtTs(e.t) : '';
     el.textContent = t || '—';
     el.className = 'vl' + (t ? '' : ' no');
+    if(kl) kl.textContent = e ? e.k : '';
   }
   // 没数据时说明原因，避免把「设备没上报」误当成「没有记录」
   var note = $('histNote');
@@ -552,10 +682,10 @@ function renderHist(){
     note.textContent = '';
   }
   var tn = $('trigNote');
-  if(hist === null){
+  if(hist === null && !offlineLog.length){
     tn.textContent = '等待设备上报记录…';
-  }else if(!(hist.trig && hist.trig[0])){
-    tn.textContent = '还没有呼叫记录（指示灯亮时把 GPIO2 接地试一次）';
+  }else if(!(hist && hist.trig && hist.trig[0]) && !offlineLog.length){
+    tn.textContent = '还没有记录（指示灯亮时把 GPIO2 接地试一次；断网超 1 分钟也会记在这里）';
   }else{
     tn.textContent = '';
   }
@@ -586,10 +716,12 @@ function showPanel(show){
 // 基线存 localStorage，所以刚打开页面不会把上一次开灯当成新事件。
 // 只在「灯亮就响」模式下判；呼叫模式下灯亮本身不该吵人。
 function checkOnTs(o){
-  if(ringOnCall) return;
   if(!o || !o.on || !o.on[0]) return;
   var t = o.on[0];
-  if(lastOnTs && t > lastOnTs) setAlarm(ALARM_MS, 'light');
+  // 基线无论哪种模式都要更新。原来呼叫模式下直接 return，
+  // 结果从「灯亮就响」切回来时 lastOnTs 还是很久以前的值，
+  // 一读就会把当前这次开启误判成新事件、莫名其妙地响一次。
+  if(!ringOnCall && lastOnTs && t > lastOnTs) setAlarm(ALARM_MS, 'light');
   lastOnTs = t;
   try{ localStorage.setItem(LS_ONTS, String(t)); }catch(e){}
 }
@@ -628,7 +760,7 @@ function readState(){
       var m = (d.msg || '').trim();
       // 状态和时间在同一条 retained 消息里（巴法云只允许往已存在的主题发布，
       // 所以没法再开一个主题单独放历史）。固件发的是
-      // {s:0|1, pin:0|1, seq:N, on:[t,t], off:[t,t], trig:[t,t,t,t,t]}。
+      // {s:0|1, pin:0|1, seq:N, on:[t,t], off:[t,t], trig:[t,t,t,t,t,t]}。
       var o = null;
       try { o = JSON.parse(m); } catch(e){ o = null; }
       if(o && typeof o === 'object' && typeof o.s !== 'undefined'){
@@ -647,6 +779,10 @@ function readState(){
       var conn = d.pubOnline ? '' : ' · 设备离线或未连接';
       foot((state === null ? '状态未知' : '已同步') + conn +
            (alarmUntil ? ' · 🔔 响铃中' : ''));
+      // 断网判定要排在 renderHist 前面：新记进来的断网时刻这一轮就能显示出来，
+      // 不用等下一次轮询。只有明确读到 false（pubOnline 为 0）才算断网；
+      // 字段整个缺失时传 undefined，checkOnline 会忽略，不误报。
+      checkOnline(d.pubOnline === undefined ? null : !!d.pubOnline);
       render();
       renderHist();
       alarmTick();
@@ -726,8 +862,9 @@ $('mode').addEventListener('click', function(e){
   ringOnCall = !ringOnCall;
   localStorage.setItem(LS_MODE, ringOnCall ? 'call' : 'light');
   renderMode();
-  foot(ringOnCall ? '响铃条件：指示灯亮 + GPIO2 低电平（呼叫）'
-                  : '响铃条件：指示灯一亮就响（旧行为）');
+  foot((ringOnCall ? '响铃条件：指示灯亮 + GPIO2 低电平（呼叫）'
+                 : '响铃条件：指示灯一亮就响（旧行为）') +
+     '。断网超过 1 分钟也会响');
 });
 
 $('wake').addEventListener('click', function(e){
@@ -747,8 +884,26 @@ $('sirenTest').addEventListener('click', function(e){
   if(!alarmOn){ cfgMsg('提示音是关的，先点左上角 🔔 打开', true); return; }
   unlockAudio();
   if(!playBeep(1)){ cfgMsg('这个浏览器不支持网页发声', true); return; }
-  if(navigator.vibrate){ try{ navigator.vibrate([320,180,500]); }catch(e){} }
-  cfgMsg('这就是灯亮时手机响的样子（1 秒）');
+  vib([320,180,500]);
+  cfgMsg('这就是灯亮时手机响的样子（1 秒）' +
+         (vibSupported() ? '' : '。注意：这台设备不支持网页震动，只有声音'));
+});
+
+// 震动自检。诊断面板那一行直接点它：
+// 支持就震一下并说明，不支持就把原因讲清楚，别让人以为页面坏了。
+$('vibRow').addEventListener('click', function(e){
+  e.stopPropagation();
+  vibPrime();
+  if(!vibSupported()){
+    cfgMsg('这台设备（多半是 iPhone/iPad）不支持网页震动，这是系统限制，改页面也没用。' +
+           '声音和系统通知正常；要震动只能换一个支持震动 API 的浏览器/安卓机。', true);
+    return;
+  }
+  if(!vib([500,200,500,200,800])){
+    cfgMsg('浏览器说支持震动但这次调用被拒绝了：检查手机是不是静音/勿扰，或开了省电模式。', true);
+    return;
+  }
+  cfgMsg('刚才应该震了两下。如果完全没感觉，多半是手机静音/勿扰模式或省电模式把震动拦了。');
 });
 
 $('lockTest').addEventListener('click', function(e){
@@ -786,10 +941,11 @@ $('notifyTest').addEventListener('click', function(e){
   renderDiag();
 });
 
-// 任何一次点击/触摸都：解锁音频 + 重新申请常亮 + 停掉正在响的铃
+// 任何一次点击/触摸都：解锁音频 + 重新申请常亮 + 震动预热 + 停掉正在响的铃
 function onTouch(){
   unlockAudio();
   requestWake();
+  vibPrime();      // 放在真实手势里，安卓才认后面那些定时震动
   if(alarmUntil) stopAlarm();
 }
 document.addEventListener('pointerdown', onTouch);
