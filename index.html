@@ -3,6 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#1a1a2e">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>远程控制</title>
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
@@ -31,6 +35,10 @@
   .hist .empty{color:#555;font-size:12px;text-align:center;margin-top:4px}
   .gear{position:absolute;top:10px;right:12px;background:none;border:none;color:#5a6480;
         font-size:20px;cursor:pointer;padding:4px 6px;line-height:1}
+  .topbar{position:absolute;top:10px;left:12px;display:flex;gap:6px}
+  .topbar button{background:none;border:1px solid #334;color:#5a6480;font-size:12px;
+                 cursor:pointer;padding:4px 8px;border-radius:8px;line-height:1;white-space:nowrap}
+  .topbar button.on{color:#4caf50;border-color:#2f5d3a}
   .panel{display:none;text-align:left;margin-top:22px;padding-top:18px;border-top:1px dashed #334}
   .panel.show{display:block}
   label{display:block;color:#bbb;font-size:13px;margin:12px 0 4px}
@@ -47,16 +55,19 @@
   .warn{color:#e0a800;font-size:12px;margin-top:10px;line-height:1.6}
   .gate{display:none;margin-top:10px}
   .gate.show{display:block}
-  .siren{position:absolute;top:10px;left:12px;background:none;border:1px solid #334;color:#5a6480;
-         font-size:12px;cursor:pointer;padding:4px 8px;border-radius:8px;line-height:1}
-  .siren.on{color:#4caf50;border-color:#2f5d3a}
   .mini.sub{background:#37474f;margin-top:10px}
+  .row2{display:flex;gap:8px}
+  .row2 .mini{margin-top:10px}
+  .hint{color:#666;font-size:11px;margin-top:8px;line-height:1.6}
 </style>
 </head>
 <body>
 <div class="card">
+  <div class="topbar">
+    <button type="button" id="siren" title="芯片灯亮时响铃">🔔 响铃开</button>
+    <button type="button" id="wake" title="锁屏也能响的关键">📱 常亮开</button>
+  </div>
   <button class="gear" type="button" id="gear" title="设置">⚙</button>
-  <button class="siren on" type="button" id="siren" title="芯片灯亮时响1秒">🔔 提示音开</button>
   <h1 id="title">LED01</h1>
   <div><span class="dot" id="dot"></span></div>
   <div class="st" id="state">--</div>
@@ -91,7 +102,12 @@
     <input id="name" placeholder="LED01">
     <button class="mini" type="button" id="save">保存设置</button>
     <button class="mini sub" type="button" id="sirenTest">试一下提示音（响 1 秒）</button>
+    <div class="row2">
+      <button class="mini sub" type="button" id="lockTest" style="background:#5d4037">试锁屏响铃（响 4 秒）</button>
+      <button class="mini sub" type="button" id="notifyTest" style="background:#4e342e">发一条通知</button>
+    </div>
     <div class="foot" id="cfgMsg"></div>
+    <div class="warn">锁屏想听到声音，靠上面两个开关：<b>📱 常亮</b>阻止手机熄屏（页面不被冻结），<b>🔔 响铃</b>一直播极低音量的保活音让音频会话不被系统挂起。两者都开，锁屏时灯亮才可能自动响。系统通知是最后一道保险（安卓可用；iPhone 需先「添加到主屏幕」）。</div>
     <div class="warn">私钥保存在本机 localStorage。别人拿到这个网页文件也控制不了你的设备，但拿到你手机/浏览器数据的人可以。私钥默认隐藏，点「显示」需输入密码。</div>
   </div>
 </div>
@@ -99,7 +115,7 @@
 var API_SEND = 'https://apis.bemfa.com/va/sendMessage';
 var API_INFO = 'https://apis.bemfa.com/vb/api/v2/topicInfo';
 var LS_UID = 'bemfa_ctl_uid', LS_TOPIC = 'bemfa_ctl_topic', LS_NAME = 'bemfa_ctl_name';
-var LS_ALARM = 'bemfa_ctl_alarm';
+var LS_ALARM = 'bemfa_ctl_alarm', LS_WAKE = 'bemfa_ctl_wake', LS_ONTS = 'bemfa_ctl_last_on';
 var DEFAULT_TOPIC = 'relay';
 // 查看私钥的密码。私钥默认以圆点隐藏，点「显示」要先过这道密码。
 var UNLOCK_PWD = '99998888';
@@ -114,28 +130,65 @@ var timer = null;
 var hist = null;         // 最近两次开启/关闭时刻（含当前状态），null=还没读到
 
 // ---------------- 灯亮提示音 ----------------
-// 芯片灯由关变亮时，手机响 1 秒并震动。
-// 只认「明确的 OFF→ON」：刚打开页面时状态是未知(null)，灯本来就亮着，不该响。
+// 芯片灯由关变亮时，手机响铃并震动。
 var alarmOn = localStorage.getItem(LS_ALARM) !== '0';
-var lastState = null;    // 上一次读到成功且已知的灯状态，null=未知
-var AC = null;
+var wakeOn  = localStorage.getItem(LS_WAKE) !== '0';
+// 最近一次已知的「开启时刻」。既是响铃判据的基线，也存进 localStorage，
+// 关掉页面再打开时不会把很久以前的那次开灯当成新事件。
+var lastOnTs = parseInt(localStorage.getItem(LS_ONTS) || '0', 10) || 0;
+var AC = null, KA = null;
+
+function $(id){ return document.getElementById(id); }
 
 function ac(){
   if(!AC){
     var C = window.AudioContext || window.webkitAudioContext;
     if(!C) return null;
     AC = new C();
+    AC.onstatechange = function(){
+      // 来电、锁屏、音频焦点被抢时系统会挂起音频会话。
+      // 恢复后立刻拉回来并重新挂上保活音源，否则下一次响铃是哑的。
+      if(AC.state === 'suspended'){
+        try{ AC.resume(); }catch(e){}
+      }else if(AC.state === 'running'){
+        startKeepAlive();
+      }
+    };
   }
   if(AC.state === 'suspended' && AC.resume) AC.resume();
   return AC;
 }
 
-// 手机浏览器禁止自动播放，必须先有一次点击手势解锁音频
+// 极低音量（≈ -68dB，手机听不见）的循环振荡器。
+// 它起两个作用：
+//   1) 让 AudioContext 一直处于 running，锁屏/切后台时不被系统挂起；
+//   2) 「正在发声」的页面在 iOS/Android 上不会被降频或冻结，
+//      setInterval 和 fetch 才停不下来。
+// 没有它，一锁屏网页基本等于死了。
+function startKeepAlive(){
+  var a = AC;
+  if(!a || a.state !== 'running' || KA) return false;
+  try{
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = 'sine';
+    o.frequency.value = 40;        // 手机扬声器放不出来的低频
+    g.gain.value = 0.0004;
+    o.connect(g); g.connect(a.destination);
+    o.start();
+    KA = {o:o, g:g};
+    return true;
+  }catch(e){ return false; }
+}
+
+// 手机浏览器禁止自动播放，必须先有一次点击手势解锁音频。
+// iOS 只认手势里同步执行的 resume()，所以这一步不能挪到别的地方。
 function unlockAudio(){
-  if(!alarmOn) return;
+  if(!alarmOn) return false;
   var a = ac();
-  if(a && a.state === 'running') return true;
-  return false;
+  if(!a) return false;
+  if(a.state === 'suspended' && a.resume) a.resume();
+  startKeepAlive();
+  return a.state === 'running';
 }
 
 function tone(a, freq, start, dur, vol){
@@ -150,33 +203,90 @@ function tone(a, freq, start, dur, vol){
   o.start(start); o.stop(start + dur + 0.02);
 }
 
-// 三声上行，总长 1 秒：0.25 + 0.25 + 0.5
-function playBeep(){
+// 每轮三声上行 880/1175/1568Hz，约 1 秒。
+function playBeep(rounds){
   var a = ac();
   if(!a) return false;
-  var t = a.currentTime + 0.02;
-  tone(a, 880,  t, 0.25, 0.30);
-  tone(a, 1175, t + 0.25, 0.25, 0.30);
-  tone(a, 1568, t + 0.50, 0.50, 0.30);
+  var t = a.currentTime + 0.05;
+  for(var i = 0; i < (rounds || 1); i++){
+    var b = t + i * 1.35;
+    tone(a, 880,  b, 0.25, 0.30);
+    tone(a, 1175, b + 0.25, 0.25, 0.30);
+    tone(a, 1568, b + 0.50, 0.50, 0.30);
+  }
   return true;
+}
+
+// ---------------- 屏幕常亮（Wake Lock） ----------------
+// 手机锁屏时浏览器会冻结页面：定时器停、fetch 不发、声音出不来。
+// Wake Lock 直接不让它锁屏，是最有效也最省事的一招。
+// 它会在页面切到后台时自动释放，所以每次回到前台都要重新申请。
+var wakeLock = null;
+
+function requestWake(){
+  if(!wakeOn) return;
+  if(!('wakeLock' in navigator)) return;
+  if(wakeLock) return;
+  try{
+    navigator.wakeLock.request('screen').then(function(s){
+      wakeLock = s;
+      s.addEventListener('release', function(){ wakeLock = null; renderWake(); });
+      renderWake();
+    })['catch'](function(){ renderWake(); });
+  }catch(e){ renderWake(); }
+}
+
+// ---------------- 系统通知 ----------------
+// 最后一道保险：通知在锁屏时照样会响铃并震动，
+// 不受「网页被冻结」影响。安卓浏览器可用；iPhone 需要先添加到主屏幕。
+function notify(title, body){
+  if(!alarmOn) return;
+  if(!('Notification' in window)) return;
+  if(Notification.permission !== 'granted') return;
+  var svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>" +
+            "<circle cx='32' cy='32' r='26' fill='#4caf50'/></svg>";
+  try{
+    new Notification(title, {
+      body: body,
+      tag: 'led01',
+      renotify: true,
+      silent: false,
+      vibrate: [400, 200, 600],
+      icon: 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg)
+    });
+  }catch(e){}
 }
 
 function alarm(){
   if(!alarmOn) return;
-  var ok = playBeep();
+  var hidden = document.hidden;
+  // 锁屏时人看不见，多响几轮才有机会听到
+  var ok = playBeep(hidden ? 4 : 2);
+  startKeepAlive();      // 响完立刻把保活音源挂回去，别让会话被回收
   if(navigator.vibrate){
-    try{ navigator.vibrate([320, 180, 500]); }catch(e){}
+    try{ navigator.vibrate(hidden ? [400,200,600,200,600,200,600] : [320,180,500]); }catch(e){}
   }
-  if(!ok) foot('手机禁止了自动播放：点一下页面任意位置即可开启提示音', true);
+  if(hidden){
+    // 看得到页面就不用通知了，免得双重打扰
+    notify(name + ' 开灯了', '灯由关变亮，手机响铃提醒');
+  }else if(!ok){
+    foot('手机禁止了自动播放：点一下页面任意位置即可开启提示音', true);
+  }
 }
 
 function renderAlarm(){
   var b = $('siren');
-  b.textContent = alarmOn ? '🔔 提示音开' : '🔕 提示音关';
-  b.className = 'siren' + (alarmOn ? ' on' : '');
+  b.textContent = alarmOn ? '🔔 响铃开' : '🔕 响铃关';
+  b.className = alarmOn ? 'on' : '';
 }
 
-function $(id){ return document.getElementById(id); }
+function renderWake(){
+  var b = $('wake');
+  if(!wakeOn){ b.textContent = '📱 常亮关'; b.className = ''; return; }
+  var on = !!wakeLock;
+  b.textContent = on ? '📱 常亮开' : '📱 常亮弱';
+  b.className = on ? 'on' : '';
+}
 
 function render(){
   $('title').textContent = name;
@@ -195,6 +305,12 @@ function foot(text, bad){
   var f = $('foot');
   f.textContent = text;
   f.className = 'foot' + (bad ? ' bad' : '');
+}
+
+function cfgMsg(text, bad){
+  var m = $('cfgMsg');
+  m.textContent = text;
+  m.className = 'foot' + (bad ? ' bad' : '');
 }
 
 function withTs(url){
@@ -239,6 +355,20 @@ function showPanel(show){
   $('panel').className = show ? 'panel show' : 'panel';
 }
 
+// 响铃判据：「最近一次开启时刻」有没有变新。
+// 不能只看「现在是开还是关」：页面被系统冻结或被浏览器丢弃时，
+// OFF→ON 那一瞬间根本没轮询到，回到页面只看到「开」，
+// 分不清是刚才开的还是开了一整天。
+// 开启时刻存在 retained 消息里，冻结结束后一比就知道。
+// 基线存 localStorage，所以刚打开页面不会把上一次开灯当成新事件。
+function checkOnTs(o){
+  if(!o || !o.on || !o.on[0]) return;
+  var t = o.on[0];
+  if(lastOnTs && t > lastOnTs) alarm();
+  lastOnTs = t;
+  try{ localStorage.setItem(LS_ONTS, String(t)); }catch(e){}
+}
+
 function readState(){
   if(!ready()) return;
   var url = API_INFO + '?openID=' + encodeURIComponent(uid) +
@@ -262,6 +392,7 @@ function readState(){
       if(o && typeof o === 'object' && typeof o.s !== 'undefined'){
         state = (o.s === 1);
         hist = o;
+        checkOnTs(o);
       }else if(m === 'on' || m === '1' || m === 'ON'){
         // 兼容旧固件：只发纯 ON/OFF 文本，没有历史
         state = true;
@@ -269,15 +400,12 @@ function readState(){
         state = false;
       }else{
         state = null;
-}
+      }
       var conn = d.pubOnline ? '' : ' · 设备离线或未连接';
-      foot((state === null ? '状态未知' : '已同步') + conn);
+      var wa = (!wakeLock) ? ' · 常亮未生效' : '';
+      foot((state === null ? '状态未知' : '已同步') + conn + wa);
       render();
       renderHist();
-      // 只有明确读到「原来是关、现在开」才响。读取失败时不改 lastState，
-      // 否则中间断一次网络就再也不会响了。
-      if(state === true && lastState === false) alarm();
-      if(state !== null) lastState = state;
     })
     .catch(function(e){ state = null; foot('网络错误：' + e.message, true); render(); });
 }
@@ -307,37 +435,92 @@ function send(cmd){
     });
 }
 
+// ---- 轮询 ----
+// 关键：页面隐藏时只是放慢，绝不停。
+// 一停，锁屏期间灯亮了也收不到消息，响铃自然不会响。
+function startTimer(){
+  if(timer) clearInterval(timer);
+  var every = document.hidden ? 5000 : 3000;
+  timer = setInterval(function(){ if(!sending) readState(); }, every);
+}
+
 $('pwr').addEventListener('click', function(){
   unlockAudio();
   if(state === null){ readState(); return; }
   send(state ? 'off' : 'on');
 });
 
-// ---- 提示音开关：点一下先解锁音频，方便当场试响 ----
+// ---- 响铃开关：点一下先解锁音频 + 申请通知权限，方便当场试响 ----
 $('siren').addEventListener('click', function(){
   alarmOn = !alarmOn;
   localStorage.setItem(LS_ALARM, alarmOn ? '1' : '0');
   renderAlarm();
   if(alarmOn){
     unlockAudio();
+    if('Notification' in window && Notification.permission === 'default'){
+      try{ Notification.requestPermission(); }catch(e){}
+    }
+    requestWake();
     var a = ac();
-    if(a && a.state !== 'running'){
+    if(!a || a.state !== 'running'){
       foot('浏览器仍在拦截声音，请点一下页面其它位置，或用安卓/苹果自带浏览器打开', true);
     }
   }
 });
 
-$('sirenTest').addEventListener('click', function(){
-  if(!alarmOn){ $('cfgMsg').textContent = '提示音是关的，先点左上角 🔔 打开'; $('cfgMsg').className = 'foot bad'; return; }
-  if(!playBeep()){ $('cfgMsg').textContent = '这个浏览器不支持网页发声'; $('cfgMsg').className = 'foot bad'; return; }
-  if(navigator.vibrate){ try{ navigator.vibrate([320, 180, 500]); }catch(e){} }
-  $('cfgMsg').textContent = '这就是灯亮时手机响的样子（1 秒）';
-  $('cfgMsg').className = 'foot';
+// ---- 常亮开关 ----
+$('wake').addEventListener('click', function(){
+  wakeOn = !wakeOn;
+  localStorage.setItem(LS_WAKE, wakeOn ? '1' : '0');
+  if(wakeOn){ requestWake(); renderWake(); }
+  else {
+    if(wakeLock){ try{ wakeLock.release(); }catch(e){} wakeLock = null; }
+    renderWake();
+  }
 });
 
-// 任何一次点击/触摸都解锁音频，之后灯亮就能自动响
+$('sirenTest').addEventListener('click', function(){
+  if(!alarmOn){ cfgMsg('提示音是关的，先点左上角 🔔 打开', true); return; }
+  unlockAudio();
+  if(!playBeep(1)){ cfgMsg('这个浏览器不支持网页发声', true); return; }
+  if(navigator.vibrate){ try{ navigator.vibrate([320,180,500]); }catch(e){} }
+  cfgMsg('这就是灯亮时手机响的样子（1 秒）');
+});
+
+$('lockTest').addEventListener('click', function(){
+  if(!alarmOn){ cfgMsg('提示音是关的，先点左上角 🔔 打开', true); return; }
+  unlockAudio();
+  requestWake();
+  playBeep(4);                       // 约 4 秒，和锁屏时一样长
+  if(navigator.vibrate){ try{ navigator.vibrate([400,200,600,200,600]); }catch(e){} }
+  if('Notification' in window && Notification.permission === 'default'){
+    try{ Notification.requestPermission(); }catch(e){}
+  }
+  cfgMsg('现在把屏幕按灭试一下；灯亮时应当能听到这串声音');
+});
+
+$('notifyTest').addEventListener('click', function(){
+  if(!('Notification' in window)){
+    cfgMsg('这个浏览器不支持网页通知（iPhone 需先「添加到主屏幕」）', true);
+    return;
+  }
+  if(Notification.permission === 'denied'){
+    cfgMsg('通知已被浏览器拒绝：到网站设置里把通知打开', true);
+    return;
+  }
+  if(Notification.permission === 'default'){
+    try{ Notification.requestPermission(); }catch(e){}
+    cfgMsg('请在弹出的提示里点「允许」，然后再点一次本按钮');
+    return;
+  }
+  notify('测试通知', name + '：锁屏时通知会照常响铃');
+  cfgMsg('已发通知。把屏幕按灭看是否出现在锁屏上（安卓可用；iPhone 需先「添加到主屏幕」）');
+});
+
+// 任何一次点击/触摸都解锁音频 + 重新申请常亮，之后灯亮就能自动响
 function onceUnlock(){
   unlockAudio();
+  requestWake();
   document.removeEventListener('pointerdown', onceUnlock);
   document.removeEventListener('touchstart', onceUnlock);
 }
@@ -406,31 +589,51 @@ $('save').addEventListener('click', function(){
   var u = $('uid').value.trim();
   var t = $('topic').value.trim() || DEFAULT_TOPIC;
   var n = $('name').value.trim() || 'LED01';
-  if(!u){ $('cfgMsg').textContent = '请填写私钥'; $('cfgMsg').className = 'foot bad'; return; }
+  if(!u){ cfgMsg('请填写私钥', true); return; }
   uid = u; topic = t; name = n;
   localStorage.setItem(LS_UID, uid);
   localStorage.setItem(LS_TOPIC, topic);
   localStorage.setItem(LS_NAME, name);
-  $('cfgMsg').textContent = '已保存到本机浏览器';
-  $('cfgMsg').className = 'foot';
+  cfgMsg('已保存到本机浏览器');
   hideUid();            // 存完立刻收回明文
   closeGate();
   showPanel(false);
   hist = null;          // 主题可能换了，之前的历史作废
+  lastOnTs = 0;         // 基线作废，避免换主题后拿旧开启时刻当新事件
+  try{ localStorage.setItem(LS_ONTS, '0'); }catch(e){}
   renderHist();
   readState();
 });
 
+// ---- 生命周期：切到后台要慢下来但不能停；回到前台补一次读取和常亮 ----
+document.addEventListener('visibilitychange', function(){
+  if(!document.hidden){
+    startTimer();
+    // 回到前台时浏览器可能刚挂起过音频会话，重新拉一把再读
+    unlockAudio();
+    requestWake();
+    readState();
+  }else{
+    startTimer();
+    startKeepAlive();
+  }
+});
+// 从「后退」缓存恢复（安卓常见）：此时 JS 直接续跑，不一定有 pointerdown
+window.addEventListener('pageshow', function(){
+  unlockAudio();
+  requestWake();
+  startTimer();
+  readState();
+});
+window.addEventListener('focus', function(){ requestWake(); });
+// Page Freeze：被冻结的页面恢复后立刻补一次读取，
+// 冻结期间漏掉的开启时刻会在这一轮被 checkOnTs 比出来
+window.addEventListener('resume', function(){ requestWake(); readState(); });
+
 if(!uid){ showPanel(true); foot('请先填巴法云私钥', true); render(); }
 else { readState(); }
-render(); renderHist(); renderAlarm();
-if(timer) clearInterval(timer);
-timer = setInterval(function(){ if(!sending) readState(); }, 3000);
-document.addEventListener('visibilitychange', function(){
-  if(document.hidden){ if(timer){ clearInterval(timer); timer = null; } }
-  else { if(!timer) timer = setInterval(function(){ if(!sending) readState(); }, 3000); readState(); }
-});
+render(); renderHist(); renderAlarm(); renderWake();
+startTimer();
 </script>
 </body>
 </html>
-
