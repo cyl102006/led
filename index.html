@@ -104,14 +104,23 @@
   </div>
 
   <div class="hist">
-    <h2>最近记录（呼叫 / 断网，最近 6 次）</h2>
-    <div class="hrow"><span class="lb" id="tk0">呼叫</span><span class="vl no" id="tg0">—</span></div>
-    <div class="hrow"><span class="lb" id="tk1"></span><span class="vl no" id="tg1">—</span></div>
-    <div class="hrow"><span class="lb" id="tk2"></span><span class="vl no" id="tg2">—</span></div>
-    <div class="hrow"><span class="lb" id="tk3"></span><span class="vl no" id="tg3">—</span></div>
-    <div class="hrow"><span class="lb" id="tk4"></span><span class="vl no" id="tg4">—</span></div>
-    <div class="hrow"><span class="lb" id="tk5"></span><span class="vl no" id="tg5">—</span></div>
+    <h2>呼叫记录（指示灯亮 + GPIO2 低电平，最近 5 次）</h2>
+    <div class="hrow"><span class="lb">呼叫</span><span class="vl no" id="tg0">—</span></div>
+    <div class="hrow"><span class="lb"></span><span class="vl no" id="tg1">—</span></div>
+    <div class="hrow"><span class="lb"></span><span class="vl no" id="tg2">—</span></div>
+    <div class="hrow"><span class="lb"></span><span class="vl no" id="tg3">—</span></div>
+    <div class="hrow"><span class="lb"></span><span class="vl no" id="tg4">—</span></div>
     <div class="empty" id="trigNote"></div>
+  </div>
+
+  <div class="hist">
+    <h2>断网记录（芯片断网超 1 分钟，最近 5 次）</h2>
+    <div class="hrow"><span class="lb">断网</span><span class="vl no" id="of0">—</span></div>
+    <div class="hrow"><span class="lb"></span><span class="vl no" id="of1">—</span></div>
+    <div class="hrow"><span class="lb"></span><span class="vl no" id="of2">—</span></div>
+    <div class="hrow"><span class="lb"></span><span class="vl no" id="of3">—</span></div>
+    <div class="hrow"><span class="lb"></span><span class="vl no" id="of4">—</span></div>
+    <div class="empty" id="offNote"></div>
   </div>
 
   <div class="panel" id="panel">
@@ -217,7 +226,7 @@ var lastBeepAt = 0;      // 上次实际发出声音的时间戳
 // 所以断网时刻存在这台手机的 localStorage 里，没法写回芯片 EEPROM。
 // 呼叫记录在芯片里（trig，6 条），断网记录在这里（6 条），
 // 渲染时两者合并成一条时间线，取最近 6 次显示。
-var LOG_N = 6;                    // 统一记录条数：总是显示最近 6 次
+var LOG_N = 5;                    // 两块记录各自固定 5 条：呼叫 5 条、断网 5 条
 var LOG_MIN_GAP_S = 60;           // 相邻两条记录至少隔 1 分钟
 var OFFLINE_ALARM_MS = 60000;     // 断网持续超过 1 分钟才报警
 var LS_OFFLOG = 'bemfa_ctl_offlog';
@@ -244,6 +253,22 @@ function pushOffline(t){
   offlineLog.unshift(t);
   if(offlineLog.length > LOG_N) offlineLog.length = LOG_N;
   saveOfflineLog();
+}
+
+// 严格解析巴法云返回的「设备是否在线」。
+// 这里必须显式枚举，不能用 if(pubOnline) 这种真值判断：
+// 巴法云在不同接口/版本里 pubOnline 可能是 0，也可能是字符串 "0"。
+// 而 "0" 在 JS 里是真值！写成真值判断的话，"0" 会被当成「在线」，
+// 于是断网永远检测不出来 —— 手机一直不响就是这么来的。
+// 返回 null 表示「这次不知道」，调用方要区别对待，不能当成断网。
+function parseOnline(v){
+  if(v === true) return true;
+  if(v === false) return false;
+  if(v === null || v === undefined || v === '') return null;
+  var s = String(v).trim().toLowerCase();
+  if(s === '1' || s === 'true' || s === 'on' || s === 'yes' || s === 'online') return true;
+  if(s === '0' || s === 'false' || s === 'off' || s === 'no' || s === 'offline') return false;
+  return null;
 }
 
 // 断网判据：读到「明确的离线」并且已经持续满 1 分钟。
@@ -399,19 +424,23 @@ function requestWake(){
 function vibSupported(){
   return (typeof navigator.vibrate === 'function');
 }
+var vibPrimed = false;   // 有没有在用户手势里震过一次
+var vibLastOk = null;    // 上一次 navigator.vibrate() 的返回值
 function vib(pat){
   if(!vibSupported()) return false;
-  try{ return navigator.vibrate(pat) !== false; }catch(e){ return false; }
+  try{ vibLastOk = navigator.vibrate(pat) !== false; }catch(e){ vibLastOk = false; }
+  return vibLastOk;
 }
 // 第一次点击页面时顺手震一下做「预热」。
-// 部分安卓浏览器要求震动发生在用户手势里，否则后续定时调用会被无视；
-// 这里把这次震动放在真正的 click 回调里，满足「手势内」的要求。
+// 安卓 Chrome 要求震动发生在用户手势里，否则后续定时调用会被静默忽略，
+// 返回 true 但手机不震。所以这里必须在真实的 click/pointerdown 回调里做，
+// 而且要在第一次「有人碰过这个页面」的时候就做，不能等到响铃那一刻——
+// 响铃是定时器发起的，那时已经没有用户手势了。
 function vibPrime(){
-  if(!vibSupported() || vibDone) return;
-  vibDone = true;
+  if(!vibSupported() || vibPrimed) return;
+  vibPrimed = true;
   try{ navigator.vibrate(30); }catch(e){}
 }
-var vibDone = false;
 
 // 响铃时的震动：比原来更长、更有节奏感，提醒窗口内每轮都会重新触发一次。
 var VIB_ALARM = [600,300,600,300,900,400,900];
@@ -563,10 +592,14 @@ function renderDiag(){
   // 震动能力：直接告诉用户这台机器到底支不支持，一眼就能定位问题
   var vEl = $('dVib');
   if(vEl){
-    if(vibSupported()){
-      vEl.textContent = '支持，点这里试'; vEl.className = 'y';
+    if(!vibSupported()){
+      vEl.textContent = '浏览器不支持'; vEl.className = 'r';
+    }else if(!vibPrimed){
+      vEl.textContent = '待激活，点页面'; vEl.className = 'w';
+    }else if(vibLastOk === false){
+      vEl.textContent = '被系统拒绝'; vEl.className = 'r';
     }else{
-      vEl.textContent = '不支持'; vEl.className = 'r';
+      vEl.textContent = '正常'; vEl.className = 'y';
     }
   }
   // 直接告诉用户还差什么，比让人自己猜要快得多
@@ -638,16 +671,44 @@ function fmtTs(ts){
          p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
 }
 
-// 把「芯片里的呼叫时刻」和「本机记的断网时刻」合成一条时间线，取最近 6 条。
-// 两个来源必须合并显示：呼叫在芯片 EEPROM 里，断网只存在这台手机上，
-// 分成两块的话「总是显示最近 6 次」就没有一个统一的口径。
-// 相邻两条至少隔 1 分钟这个规则在写入时已经各自守住了，这里只管排序和截断。
-function mergedEvents(){
-  var out = [], tg = (hist && hist.trig) || [], i;
-  for(i = 0; i < tg.length; i++){ if(tg[i]) out.push({t: tg[i], k: '呼叫'}); }
-  for(i = 0; i < offlineLog.length; i++){ if(offlineLog[i]) out.push({t: offlineLog[i], k: '断网'}); }
-  out.sort(function(a, b){ return b.t - a.t; });
-  return out.slice(0, LOG_N);
+// 呼叫记录：芯片 EEPROM 里来的，固定 5 行，不够补「—」。
+// 「相邻至少 1 分钟」这条规则在固件写入时就守住了，这里只管显示。
+function renderTrig(){
+  var tg = (hist && hist.trig) || [];
+  for(var i = 0; i < LOG_N; i++){
+    var el = document.getElementById('tg' + i);
+    if(!el) continue;
+    var t = fmtTs(tg[i]);
+    el.textContent = t || '—';
+    el.className = 'vl' + (t ? '' : ' no');
+  }
+  var tn = $('trigNote');
+  if(hist === null){
+    tn.textContent = '等待设备上报记录…';
+  }else if(!(hist.trig && hist.trig[0])){
+    tn.textContent = '还没有呼叫记录（指示灯亮时把 GPIO2 接地试一次）';
+  }else{
+    tn.textContent = '';
+  }
+}
+
+// 断网记录：只存在这台手机里（芯片自己不知道有没有人在看它），固定 5 行。
+function renderOffline(){
+  for(var i = 0; i < LOG_N; i++){
+    var el = document.getElementById('of' + i);
+    if(!el) continue;
+    var t = fmtTs(offlineLog[i]);
+    el.textContent = t || '—';
+    el.className = 'vl' + (t ? '' : ' no');
+  }
+  var on = $('offNote');
+  if(offlineLog.length){
+    on.textContent = '';
+  }else if(!offlineSince){
+    on.textContent = '设备一直在线，没有断过';
+  }else{
+    on.textContent = '正在断网，还没满 1 分钟，不记录';
+  }
 }
 
 function renderHist(){
@@ -659,19 +720,11 @@ function renderHist(){
     el.textContent = t || '—';
     el.className = 'vl' + (t ? '' : ' no');
   });
-  // 统一记录固定画 6 行：固件保证 trig 有 6 个槽，断网记录本机最多存 6 条，
-  // 合并后不够的补 —，这样「总是显示最近 6 次」，不会有时 2 行有时 6 行。
-  var ev = mergedEvents();
-  for(var i = 0; i < LOG_N; i++){
-    var el = document.getElementById('tg' + i);
-    var kl = document.getElementById('tk' + i);
-    if(!el) continue;
-    var e = ev[i];
-    var t = e ? fmtTs(e.t) : '';
-    el.textContent = t || '—';
-    el.className = 'vl' + (t ? '' : ' no');
-    if(kl) kl.textContent = e ? e.k : '';
-  }
+  // 呼叫记录固定 5 行、断网记录固定 5 行，各自不够补 —。
+  // 两块分开画，不混成一条时间线：呼叫来自芯片，断网只存在本机，
+  // 混在一起的话「哪几条是呼叫、哪几条是断网」就分不清了。
+  renderTrig();
+  renderOffline();
   // 没数据时说明原因，避免把「设备没上报」误当成「没有记录」
   var note = $('histNote');
   if(hist === null){
@@ -680,14 +733,6 @@ function renderHist(){
     note.textContent = '还没有开关记录';
   }else{
     note.textContent = '';
-  }
-  var tn = $('trigNote');
-  if(hist === null && !offlineLog.length){
-    tn.textContent = '等待设备上报记录…';
-  }else if(!(hist && hist.trig && hist.trig[0]) && !offlineLog.length){
-    tn.textContent = '还没有记录（指示灯亮时把 GPIO2 接地试一次；断网超 1 分钟也会记在这里）';
-  }else{
-    tn.textContent = '';
   }
   // GPIO2 当前电平
   var pd = $('pinDot');
@@ -776,13 +821,13 @@ function readState(){
       }else{
         state = null;
       }
-      var conn = d.pubOnline ? '' : ' · 设备离线或未连接';
+      var conn = parseOnline(d.pubOnline) === false ? ' · 设备离线或未连接' : '';
       foot((state === null ? '状态未知' : '已同步') + conn +
            (alarmUntil ? ' · 🔔 响铃中' : ''));
-      // 断网判定要排在 renderHist 前面：新记进来的断网时刻这一轮就能显示出来，
-      // 不用等下一次轮询。只有明确读到 false（pubOnline 为 0）才算断网；
-      // 字段整个缺失时传 undefined，checkOnline 会忽略，不误报。
-      checkOnline(d.pubOnline === undefined ? null : !!d.pubOnline);
+      // 断网判定要排在 renderHist 前面：新记进来的断网时刻这一轮就能显示出来。
+      // parseOnline 把 pubOnline 归一化成 true/false/null：
+      // null（读不到 / 字段缺失）一律不当断网，避免网络抖动误报。
+      checkOnline(parseOnline(d.pubOnline));
       render();
       renderHist();
       alarmTick();
@@ -894,16 +939,18 @@ $('sirenTest').addEventListener('click', function(e){
 $('vibRow').addEventListener('click', function(e){
   e.stopPropagation();
   vibPrime();
+  renderDiag();
   if(!vibSupported()){
-    cfgMsg('这台设备（多半是 iPhone/iPad）不支持网页震动，这是系统限制，改页面也没用。' +
-           '声音和系统通知正常；要震动只能换一个支持震动 API 的浏览器/安卓机。', true);
+    cfgMsg('这个浏览器没有震动 API（navigator.vibrate 不存在）。安卓上请用 Chrome，' +
+           '不要用微信/QQ/UC 内置浏览器，也不要用 Firefox 安卓版（它们都不支持）。', true);
     return;
   }
   if(!vib([500,200,500,200,800])){
-    cfgMsg('浏览器说支持震动但这次调用被拒绝了：检查手机是不是静音/勿扰，或开了省电模式。', true);
+    cfgMsg('浏览器返回了「拒绝震动」。检查手机：静音模式、勿扰模式、省电模式都会拦掉震动。', true);
     return;
   }
-  cfgMsg('刚才应该震了两下。如果完全没感觉，多半是手机静音/勿扰模式或省电模式把震动拦了。');
+  cfgMsg('刚才应该震了两下。完全没感觉的话，多半是静音/勿扰/省电模式把震动吞了——' +
+         '声音不受影响，但震动会被这三个设置拦下来。');
 });
 
 $('lockTest').addEventListener('click', function(e){
